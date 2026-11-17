@@ -1,0 +1,13 @@
+biopython>=1.81
+pandas>=2.0.2
+scikit-learn>=1.2.2
+scipy
+torch>=2.0.1
+torchvision
+tqdm>=4.65.0
+transformers>=4.30.1,<=4.33.3
+einops
+peft
+alphagenome-pytorch
+huggingface_hub
+pyarrow
