@@ -1,3 +1,0 @@
-# Include the requirements
-include requirements.txt
-include pyproject.toml

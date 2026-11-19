@@ -35,7 +35,7 @@ result_df = result.df[["variant_idx", "gene_id", "gene_name"]]
 
 
 df_annotated = df.merge(result_df, on="variant_idx", how="left")
-def_annotated = df_annotated.drop(columns=["variant_idx"])
+df_annotated = df_annotated.drop(columns=["variant_idx"])
 df_annotated = df_annotated.dropna(subset=["gene_name"])
 
 

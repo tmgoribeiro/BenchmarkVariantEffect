@@ -23,17 +23,13 @@ from functools import partial
 import os
 import math
 
-from bend.models.awd_lstm import AWDLSTMModelForInference
-from bend.models.dilated_cnn import ConvNetModel
 from bend.models.gena_lm import BertModel as GenaLMBertModel
 from bend.models.hyena_dna import HyenaDNAPreTrainedModel, CharacterTokenizer
-from bend.models.dnabert2 import BertModel as DNABert2BertModel
 from bend.models.dnabert2 import BertForMaskedLM as DNABert2BertForMaskedLM
-from bend.utils.download import download_model, download_model_zenodo
-from transformers import AutoModel
+from bend.utils.download import download_model_zenodo
+from transformers import logging, BertModel, BertConfig, BertTokenizer, AutoModel, AutoTokenizer, BigBirdModel, AutoModelForMaskedLM
 
 from tqdm.auto import tqdm
-from transformers import logging, BertModel, BertConfig, BertTokenizer, AutoModel, AutoTokenizer, BigBirdModel, AutoModelForMaskedLM
 from sklearn.preprocessing import LabelEncoder
 from alphagenome_pytorch import AlphaGenome
 logging.set_verbosity_error()
@@ -459,124 +455,6 @@ class NucleotideTransformerEmbedder(BaseEmbedder):
         new_embeddings = np.concatenate(new_embeddings, axis=1)
         return new_embeddings
 
-
-
-class AWDLSTMEmbedder(BaseEmbedder):
-    """
-    Embed using the AWD-LSTM (https://arxiv.org/abs/1708.02182) baseline LM trained in BEND.
-    """
-
-    def load_model(self, model_path, **kwargs):
-        """
-        Load the AWD-LSTM baseline LM trained in BEND.
-
-        Parameters
-        ----------
-        model_path : str
-            The path to the model directory.
-            If the model path does not exist, it will be downloaded from https://sid.erda.dk/cgi-sid/ls.py?share_id=dbQM0pgSlM&current_dir=pretrained_models&flags=f
-        """
-
-
-        # download model if not exists
-        if not os.path.exists(model_path):
-            print(f'Path {model_path} does not exists, model is downloaded from https://sid.erda.dk/cgi-sid/ls.py?share_id=dbQM0pgSlM&current_dir=pretrained_models&flags=f')
-            download_model(model = 'awd_lstm',
-                           destination_dir = model_path)
-        # Get pretrained model
-        self.model = AWDLSTMModelForInference.from_pretrained(model_path)
-        self.model.to(device)
-        self.model.eval()
-
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-
-    def embed(self, sequences: List[str], disable_tqdm: bool = False, upsample_embeddings: bool = False):
-        """
-        Embed sequences using the AWD-LSTM baseline LM trained in BEND.
-
-        Parameters
-        ----------
-        sequences : List[str]
-            List of sequences to embed.
-        disable_tqdm : bool, optional
-            Whether to disable the tqdm progress bar. Defaults to False.
-        upsample_embeddings : bool, optional
-            Whether to upsample the embeddings to the length of the input sequence. Defaults to False.
-            Only provided for compatibility with other embedders. GPN embeddings are already the same length as the input sequence.
-
-        Returns
-        -------
-        List[np.ndarray]
-            List of embeddings.
-        """
-        embeddings = []
-        with torch.no_grad():
-            for s in tqdm(sequences, disable=disable_tqdm):
-
-                input_ids = self.tokenizer(s, return_tensors="pt", return_attention_mask=False, return_token_type_ids=False)["input_ids"]
-                input_ids = input_ids.to(device)
-                embedding = self.model(input_ids=input_ids).last_hidden_state
-                
-                embeddings.append(embedding.detach().cpu().numpy())
-                # embeddings.append(embedding.detach().cpu().numpy()[:,1:])
-            
-        return embeddings
-
-class ConvNetEmbedder(BaseEmbedder):
-    """
-    Embed using the GPN-inspired ConvNet baseline LM trained in BEND.
-    """
-    def load_model(self, model_path, **kwargs):
-        """
-        Load the GPN-inspired ConvNet baseline LM trained in BEND.
-
-        Parameters
-        ----------
-        model_path : str
-            The path to the model directory.
-            If the model path does not exist, it will be downloaded from https://sid.erda.dk/cgi-sid/ls.py?share_id=dbQM0pgSlM&current_dir=pretrained_models&flags=f
-        """
-
-        logging.set_verbosity_error()
-        if not os.path.exists(model_path):
-            print(f'Path {model_path} does not exists, model is downloaded from https://sid.erda.dk/cgi-sid/ls.py?share_id=dbQM0pgSlM&current_dir=pretrained_models&flags=f')
-            download_model(model = 'convnet',
-                           destination_dir = model_path)
-        # load tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        # load model        
-        self.model = ConvNetModel.from_pretrained(model_path).to(device).eval()
-    
-    def embed(self, sequences: List[str], disable_tqdm: bool = False, upsample_embeddings: bool = False):
-        """
-        Embed sequences using the GPN-inspired ConvNet baseline LM trained in BEND.
-
-        Parameters
-        ----------
-        sequences : List[str]
-            List of sequences to embed.
-        disable_tqdm : bool, optional
-            Whether to disable the tqdm progress bar. Defaults to False.
-        upsample_embeddings : bool, optional
-            Whether to upsample the embeddings to the length of the input sequence. Defaults to False.
-            Only provided for compatibility with other embedders. GPN embeddings are already the same length as the input sequence.
-
-        Returns
-        -------
-        List[np.ndarray]
-            List of embeddings.
-        """
-        embeddings = [] 
-        with torch.no_grad():
-            for s in tqdm(sequences, disable=disable_tqdm):
-                input_ids = self.tokenizer(s, return_tensors="pt", return_attention_mask=False, return_token_type_ids=False)["input_ids"]
-                input_ids = input_ids.to(device)
-                embedding = self.model(input_ids=input_ids).last_hidden_state
-                embeddings.append(embedding.detach().cpu().numpy())
-
-        return embeddings
-    
-        
 
 class GENALMEmbedder(BaseEmbedder):
     """
@@ -1261,48 +1139,6 @@ class GROVEREmbedder(BaseEmbedder):
         return new_embeddings
 
 
-class CaduceusEmbedder(BaseEmbedder):
-
-    def load_model(self, model_name: str = "kuleshov-group/caduceus-ph_seqlen-131k_d_model-256_n_layer-16", return_logits: bool=False, return_loss: bool=False, **kwargs):
-        """
-        Load the Caduceus model (https://arxiv.org/abs/2403.03234).
-
-        Parameters
-        ----------
-        model_name : str, optional
-            The name of the model to load. Defaults to "kuleshov-group/caduceus-ph_seqlen-131k_d_model-256_n_layer-16".
-            When providing a name, the model will be loaded from the HuggingFace model hub.
-            Alternatively, you can provide a path to a local model directory.
-        return_logits : bool, optional
-            If True, returns logits instead of embeddings. Defaults to False.
-        return_loss : bool, optional
-            If True, returns the unreduced next token prediction loss. Incompatible with return_logits. 
-            We trim special tokens from the output so that the loss is only computed on the ACTGN vocabulary.
-              Defaults to False.
-
-        
-        """
-        # check that we have mamba-ssm==1.2.0.post1
-        try:
-            import mamba_ssm
-        except ImportError:
-            raise ImportError('Caduceus requires mamba-ssm==1.2.0.post1. Please install it with `pip install mamba-ssm==1.2.0.post1`.')
-        if mamba_ssm.__version__ != '1.2.0.post1':
-            raise ImportError('Caduceus requires mamba-ssm==1.2.0.post1. Please install it with `pip install mamba-ssm==1.2.0.post1`.')
-        
-
-        if return_logits and return_loss:
-            raise ValueError('Only one of return_logits and return_loss can be True')
-
-        self.max_length = 131072
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        self.model = AutoModelForMaskedLM.from_pretrained(model_name, trust_remote_code=True)
-        self.model.eval()
-        self.model.to(device)
-
-        self.return_logits = return_logits
-        self.return_loss = return_loss
-
     def embed(self, sequences: List[str], disable_tqdm: bool = False, remove_special_tokens: bool = True, upsample_embeddings: bool = False):
         """
         Embed sequences using the Caduceus model.
@@ -1363,59 +1199,6 @@ class CaduceusEmbedder(BaseEmbedder):
 # Class for one-hot encoding.
 categories_4_letters_unknown = ['A', 'C', 'G', 'N', 'T']
 
-class OneHotEmbedder(BaseEmbedder):
-    """Onehot encode sequences"""
-
-    def __init__(self, nucleotide_categories = categories_4_letters_unknown):
-        """Get an onehot encoder for nucleotide sequences.
-        
-        Parameters
-        ----------
-        nucleotide_categories : List[str], optional
-            List of nucleotides in the alphabet. Defaults to ['A', 'C', 'G', 'N', 'T'].
-        """
-        
-        self.nucleotide_categories = nucleotide_categories
-        
-        self.label_encoder = LabelEncoder().fit(self.nucleotide_categories)
-    
-    def embed(self, sequences: List[str], disable_tqdm: bool = False, return_onehot: bool = False, upsample_embeddings: bool = False):
-        """Onehot encode sequences.
-
-        Parameters
-        ----------
-        sequences : List[str]
-            List of sequences to embed.
-        disable_tqdm : bool, optional
-            Whether to disable the tqdm progress bar. Defaults to False.
-        return_onehot : bool, optional
-            Whether to return onehot encoded sequences. Defaults to False.
-            If false, returns integer encoded sequences.
-        upsample_embeddings : bool, optional
-            Whether to upsample the embeddings to match the length of the input sequences. Defaults to False.
-
-        Returns
-        -------
-        embeddings : List[np.ndarray]
-            List of one-hot encodings or integer encodings, depending on return_onehot.
-        """
-        # """Onehot endode sequences"""
-        embeddings = []
-        for s in tqdm(sequences, disable=disable_tqdm):
-            s = self._transform_integer(s, return_onehot = return_onehot)
-            s = s[None,:] # dummy batch dim, as customary for embeddings
-            embeddings.append(s)
-        return embeddings
-    
-    def _transform_integer(self, sequence : str, return_onehot = False): # integer/onehot encode sequence
-        sequence = np.array(list(sequence))
-        
-        sequence = self.label_encoder.transform(sequence)
-        if return_onehot:
-            sequence = np.eye(len(self.nucleotide_categories))[sequence]
-        return sequence
-        
-
 class EncodeSequence:
     def __init__(self, nucleotide_categories = categories_4_letters_unknown):
         
@@ -1435,74 +1218,7 @@ class EncodeSequence:
         if return_onehot:
             sequence = np.eye(len(self.nucleotide_categories))[sequence]
         return sequence
-    
-    def inverse_transform_integer(self, sequence):
-        if isinstance(sequence, str): # if input is str
-            return sequence
-        sequence = EncodeSequence.reduce_last_dim(sequence) # reduce last dim
-        sequence = self.label_encoder.inverse_transform(sequence)
-        return ('').join(sequence)
-    
-    @staticmethod
-    def reduce_last_dim(sequence):
-        if isinstance(sequence, (str, list)): # if input is str
-            return sequence
-        if len(sequence.shape) > 1:
-            sequence = np.argmax(sequence, axis=-1)
-        return sequence
 
-
-# backward compatibility
-def embed_dnabert(sequences, path: str, kmer: int = 3, disable_tqdm = False):
-    return DNABertEmbedder(path, kmer).embed(sequences, disable_tqdm = disable_tqdm)
-
-def embed_gpn(sequences):
-    return GPNEmbedder().embed(sequences)
-
-def embed_nucleotide_transformer(sequences, model_name):
-    return NucleotideTransformerEmbedder(model_name).embed(sequences)
-
-def embed_awdlstm(sequences, model_path, disable_tqdm = False, **kwargs):
-    return AWDLSTMEmbedder(model_path, **kwargs).embed(sequences, disable_tqdm = disable_tqdm )
-
-def embed_convnet(sequences, model_path, disable_tqdm = False, **kwargs):
-    return ConvNetEmbedder(model_path, **kwargs).embed(sequences, disable_tqdm = disable_tqdm)
-
-def embed_sequence(sequences : List[str], embedding_type : str = 'categorical', **kwargs):
-    '''
-    sequences : list of sequences to embed
-    '''
-    if not embedding_type:
-        return sequences
-    
-    if embedding_type == 'categorical' or embedding_type == 'onehot':
-        encode_seq = EncodeSequence() 
-        # embed to categorcal  
-        sequence = []
-        for seq in sequences:
-            sequence.append(torch.tensor(encode_seq.transform_integer(seq)))
-            return sequence
-    # embed with nt transformer:   
-    elif embedding_type == 'nt_transformer':
-        # model name "InstaDeepAI/nucleotide-transformer-2.5b-multi-species"
-        sequences, cls_token = embed_nucleotide_transformer(sequences, **kwargs)
-        return sequences, cls_token
-    # embed with GPN 
-    # embed with DNAbert
-    elif embedding_type == 'dnabert':
-        sequences = embed_dnabert(sequences, disable_tqdm = True, **kwargs)
-        # /z/home/frma/projects/DNA-LM/external-models/DNABERT/DNABERT3/
-        # kmer = 3 
-        return sequences
-    # embed with own models. 
-    elif embedding_type == 'awdlstm':
-        sequences = embed_awdlstm(sequences, disable_tqdm = True, **kwargs)
-        return sequences
-    elif embedding_type == 'convnet':
-        sequences = embed_convnet(sequences, disable_tqdm = True, **kwargs)
-        return sequences
-
-    return sequences
 
 class AlphaGenomeEmbedder(BaseEmbedder):
     

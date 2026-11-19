@@ -119,9 +119,46 @@ class Annotation:
 
         
         item = self.get_item(index)
-         
-        # get dna segment from genome dict  
-        dna_segment =  str(self.genome_dict[item.chromosome].seq[int(item.start) : int(item.end)]) 
-        
-        return dna_segment 
+
+        # get dna segment from genome dict
+        dna_segment =  str(self.genome_dict[item.chromosome].seq[int(item.start) : int(item.end)])
+
+        return dna_segment
+
+    def check_reference(self, variant_idx: int, max_mismatch_fraction: float = 0.05) -> int:
+        """Check that the reference allele of each variant is found at ``variant_idx`` of its segment.
+
+        A wrong genome build or coordinate convention raises no error anywhere else, it only gives
+        wrong embeddings. Does nothing if the annotation has no ``ref`` column.
+
+        Parameters
+        ----------
+        variant_idx : int
+            Position of the variant inside each segment.
+        max_mismatch_fraction : float, optional
+            Fraction of mismatching variants above which an error is raised. The default is 0.05.
+
+        Raises
+        ------
+        ValueError
+            If more than ``max_mismatch_fraction`` of the reference alleles do not match the genome.
+
+        Returns
+        -------
+        mismatches : int
+            Number of variants whose reference allele does not match the genome.
+        """
+        if 'ref' not in self.annotation.columns:
+            print('No ref column in the bed file, skipping the reference allele check')
+            return 0
+
+        mismatches = sum(
+            self.get_dna_segment(index=i)[variant_idx].upper() != str(ref).upper()
+            for i, ref in enumerate(self.annotation['ref'])
+        )
+        print(f'Reference allele check: {mismatches} of {len(self.annotation)} variants do not match the genome')
+        if mismatches > max_mismatch_fraction * len(self.annotation):
+            raise ValueError(f'More than {max_mismatch_fraction:.0%} of the reference alleles do not match the genome at the variant position. '
+                             'Check the genome build and the coordinates of the bed file.')
+        return mismatches 
     

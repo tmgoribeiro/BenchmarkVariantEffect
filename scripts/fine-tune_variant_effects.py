@@ -6,12 +6,11 @@ from scipy import spatial
 import time
 import torch
 import torchvision.models as models
-from torch.profiler import profile, ProfilerActivity, record_function
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
 import torch.nn.functional as F
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, average_precision_score
 
 
 class VariantPairDataset(Dataset):
@@ -50,14 +49,15 @@ def main():
     parser = argparse.ArgumentParser('Compute embeddings')
     parser.add_argument('bed_file', type=str, help='Path to the bed file')
     # model can be any of the ones supported by bend.utils.embedders
-    parser.add_argument('model', choices=['ag', 'nt', 'dnabert', 'awdlstm', 'gpn', 'convnet', 'genalm', 'hyenadna', 'dnabert2','grover'], type=str, help='Model architecture for computing embeddings')
+    parser.add_argument('model', choices=['ag', 'nt', 'dnabert', 'gpn', 'genalm', 'hyenadna', 'dnabert2','grover'], type=str, help='Model architecture for computing embeddings')
     parser.add_argument('checkpoint', type=str, help='Path to or name of the model checkpoint')
     parser.add_argument('genome', type=str, help='Path to the reference genome fasta file')
     parser.add_argument('batch_size', type=int, help='Fine-tuning batch size')
     parser.add_argument('epochs', type=int, help='Fine-tuning epochs')
     parser.add_argument('--extra_context', type=int, default=256, help='Number of extra nucleotides to include on each side of the sequence')
     parser.add_argument('--kmer', type=int, default=3, help = 'Kmer size for the DNABERT model')
-    parser.add_argument('--embedding_idx', type=int, default=256, help = 'Index of the embedding to use for computing the distance')
+    parser.add_argument('--embedding_idx', type=int, default=None, help = 'Index of the embedding to use for computing the distance. Defaults to the position of the variant in the window')
+    parser.add_argument('--max_variants', type=int, default=None, help = 'Only use the first N variants (for quick tests). Defaults to all')
 
     args = parser.parse_args()
 
@@ -75,15 +75,8 @@ def main():
          kwargs['upsample_embeddings'] = True # each nucleotide has an embedding
     elif args.model == 'dnabert':
         embedder = embedders.DNABertEmbedder(args.checkpoint, kmer = args.kmer)
-    elif args.model == 'awdlstm':
-        # autogressive model. No use for right context.
-        extra_context_left = args.extra_context
-        extra_context_right = 0
-        embedder = embedders.AWDLSTMEmbedder(args.checkpoint)
     elif args.model == 'gpn':
         embedder = embedders.GPNEmbedder(args.checkpoint)
-    elif args.model == 'convnet':
-        embedder = embedders.ConvNetEmbedder(args.checkpoint)
     elif args.model == 'genalm':
         embedder = embedders.GENALMEmbedder(args.checkpoint)
         kwargs['upsample_embeddings'] = True # each nucleotide has an embedding
@@ -104,27 +97,34 @@ def main():
 
     # load the bed file
     genome_annotation = Annotation(args.bed_file, reference_genome=args.genome)
+    if args.max_variants is not None:
+        genome_annotation.annotation = genome_annotation.annotation.iloc[:args.max_variants].reset_index(drop=True)
 
+    # The variant is at the 0-based position `start`. Normalise the segments so that it ends up at
+    # index extra_context_left of the window (see predict_variant_effects.py).
+    causal = extra_context_right == 0
+    genome_annotation.annotation['end'] = genome_annotation.annotation['start'] + int(causal)
 
     # extend the segments if necessary
     if args.extra_context > 0:
         genome_annotation.extend_segments(extra_context_left=extra_context_left, extra_context_right=extra_context_right)
 
+    variant_idx = extra_context_left if args.extra_context > 0 else 0
+    if args.embedding_idx is None:
+        args.embedding_idx = variant_idx
+    genome_annotation.check_reference(variant_idx)
+
     wt_sequences, alt_sequences, labels = [], [], []
 
     for index, row in tqdm(genome_annotation.annotation.iterrows(), desc="Building sequence pairs"):
-        dna = genome_annotation.get_dna_segment(index=index)
+        dna = genome_annotation.get_dna_segment(index=index).upper().replace('N', 'A')
         dna_alt = list(dna)
-        dna_alt[len(dna_alt) // 2] = row['alt']
+        dna_alt[variant_idx] = row['alt']
         dna_alt = ''.join(dna_alt)
 
         wt_sequences.append(dna)
         alt_sequences.append(dna_alt)
         labels.append(row['label'])
-
-    wt_sequences = wt_sequences[:100]
-    alt_sequences = alt_sequences[:100]
-    labels = labels[:100]
 
     trainval_idx, test_idx = train_test_split(
             range(len(labels)),
@@ -220,7 +220,9 @@ def main():
         test_distance.append(d)
 
     final_score = roc_auc_score(test_labels, test_distance)
+    final_auprc = average_precision_score(test_labels, test_distance)
     print(f"Final Score: {final_score}")
+    print(f"AUPRC: {final_auprc}")
 
 
 

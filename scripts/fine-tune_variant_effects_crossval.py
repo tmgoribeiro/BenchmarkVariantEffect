@@ -115,13 +115,8 @@ def get_embedder(args):
         kwargs['upsample_embeddings'] = True
     elif args.model == 'dnabert':
         embedder = embedders.DNABertEmbedder(args.checkpoint, kmer=args.kmer)
-    elif args.model == 'awdlstm':
-        extra_context_right = 0
-        embedder = embedders.AWDLSTMEmbedder(args.checkpoint)
     elif args.model == 'gpn':
         embedder = embedders.GPNEmbedder(args.checkpoint)
-    elif args.model == 'convnet':
-        embedder = embedders.ConvNetEmbedder(args.checkpoint)
     elif args.model == 'genalm':
         embedder = embedders.GENALMEmbedder(args.checkpoint)
         kwargs['upsample_embeddings'] = True
@@ -143,14 +138,15 @@ def get_embedder(args):
 def main():
     parser = argparse.ArgumentParser('Compute embeddings')
     parser.add_argument('bed_file', type=str, help='Path to the bed file')
-    parser.add_argument('model', choices=['ag', 'nt', 'dnabert', 'awdlstm', 'gpn', 'convnet', 'genalm', 'hyenadna', 'dnabert2', 'grover'], type=str, help='Model architecture for computing embeddings')
+    parser.add_argument('model', choices=['ag', 'nt', 'dnabert', 'gpn', 'genalm', 'hyenadna', 'dnabert2', 'grover'], type=str, help='Model architecture for computing embeddings')
     parser.add_argument('checkpoint', type=str, help='Path to or name of the model checkpoint')
     parser.add_argument('genome', type=str, help='Path to the reference genome fasta file')
     parser.add_argument('batch_size', type=int, help='Fine-tuning batch size')
     parser.add_argument('epochs', type=int, help='Fine-tuning epochs per fold')
     parser.add_argument('--extra_context', type=int, default=256, help='Number of extra nucleotides to include on each side of the sequence')
     parser.add_argument('--kmer', type=int, default=3, help='Kmer size for the DNABERT model')
-    parser.add_argument('--embedding_idx', type=int, default=256, help='Index of the embedding to use for computing the distance')
+    parser.add_argument('--embedding_idx', type=int, default=None, help='Index of the embedding to use for computing the distance. Defaults to the position of the variant in the window')
+    parser.add_argument('--max_variants', type=int, default=None, help='Only use the first N variants (for quick tests). Defaults to all')
     parser.add_argument('--n_folds', type=int, default=5, help='Number of cross-validation folds')
     parser.add_argument('--out_dir', type=str, default=None, help='Where fold/final checkpoints are saved')
 
@@ -159,38 +155,49 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     #os.makedirs(args.out_dir, exist_ok=True)
 
+    # only needed for the context sizes; a fresh embedder is loaded for every fold below
     embedder, extra_context_left, extra_context_right = get_embedder(args)
+    del embedder
 
     genome_annotation = Annotation(args.bed_file, reference_genome=args.genome)
+    if args.max_variants is not None:
+        genome_annotation.annotation = genome_annotation.annotation.iloc[:args.max_variants].reset_index(drop=True)
+
+    # The variant is at the 0-based position `start`. Normalise the segments so that it ends up at
+    # index extra_context_left of the window (see predict_variant_effects.py).
+    causal = extra_context_right == 0
+    genome_annotation.annotation['end'] = genome_annotation.annotation['start'] + int(causal)
 
     if args.extra_context > 0:
         genome_annotation.extend_segments(extra_context_left=extra_context_left, extra_context_right=extra_context_right)
 
+    variant_idx = extra_context_left if args.extra_context > 0 else 0
+    if args.embedding_idx is None:
+        args.embedding_idx = variant_idx
+    genome_annotation.check_reference(variant_idx)
+
     wt_sequences, alt_sequences, labels = [], [], []
     for index, row in tqdm(genome_annotation.annotation.iterrows(), desc="Building sequence pairs"):
-        dna = genome_annotation.get_dna_segment(index=index)
+        dna = genome_annotation.get_dna_segment(index=index).upper().replace('N', 'A')
         dna_alt = list(dna)
-        dna_alt[len(dna_alt) // 2] = row['alt']
+        dna_alt[variant_idx] = row['alt']
         dna_alt = ''.join(dna_alt)
 
         wt_sequences.append(dna)
         alt_sequences.append(dna_alt)
         labels.append(row['label'])
 
-    # temp
-    wt_sequences = wt_sequences[:100]
-    alt_sequences = alt_sequences[:100]
-    labels = labels[:100]
-
-    # 2) 5-fold (stratified) cross-validation on the remaining trainval data.
+    # stratified k-fold cross-validation
     skf = StratifiedKFold(n_splits=args.n_folds, shuffle=True, random_state=42)
 
     fold_val_losses = []
     for fold, (tr_rel, val_rel) in enumerate(skf.split(np.zeros(len(labels)), labels)):
         print(f"\n=== Fold {fold + 1}/{args.n_folds} ===")
 
-        train_loader = build_loader(wt_sequences, alt_sequences, labels, args.batch_size, shuffle=True)
-        val_loader = build_loader(wt_sequences, alt_sequences, labels, args.batch_size, shuffle=False)
+        train_loader = build_loader([wt_sequences[i] for i in tr_rel], [alt_sequences[i] for i in tr_rel],
+                                    [labels[i] for i in tr_rel], args.batch_size, shuffle=True)
+        val_loader = build_loader([wt_sequences[i] for i in val_rel], [alt_sequences[i] for i in val_rel],
+                                  [labels[i] for i in val_rel], args.batch_size, shuffle=False)
 
         # Reset the embedder's trainable weights for each fold.
         embedder, _, _ = get_embedder(args)

@@ -1,21 +1,21 @@
 # 🧬 Benchmarking DNA Language Models on Variant Effect Prediction
 
-This repository benchmarks pretrained DNA language models (and sequence-to-function models) on **non-coding variant effect prediction**. It is built on top of the [BEND](https://github.com/frederikkemarin/BEND) codebase (Marin et al., ICLR 2024), reduced to the variant effect task and extended with:
+This repository benchmarks pretrained DNA language models (and sequence-to-function models) on non-coding variant effect prediction. It is built on top of the [BEND](https://github.com/frederikkemarin/BEND) codebase (Marin et al., ICLR 2024), reduced to the variant effect task and extended with:
 
-- two new embedders: **AlphaGenome** (via `alphagenome-pytorch`) and **Borzoi** (via `borzoi-pytorch`);
-- **LoRA fine-tuning** of DNABERT-2 with a contrastive loss on reference/alternative sequence pairs;
-- per-run logging of the embeddings, cosine distances and AUROC;
+- two new embedders: AlphaGenome (via `alphagenome-pytorch`) and Borzoi (via `borzoi-pytorch`);
+- LoRA fine-tuning of DNABERT-2 with a contrastive loss on reference/alternative sequence pairs;
+- per-run logging of the embeddings, cosine distances, AUROC and AUPRC;
 - a helper script to annotate variants with the genes they fall in (GENCODE).
 
 ## How it works
 
-For each variant in a `bed` file:
+For each variant in a bed file:
 
 1. A window of the reference genome around the variant is extracted (`--extra_context` nucleotides on each side).
-2. A second copy of the window is made with the reference base replaced by the alternative allele (`alt`).
+2. A second copy of the window is made with the reference base replaced by the alternative allele (alt).
 3. Both sequences are embedded with the chosen model, and the embedding vector at the variant position (`--embedding_idx`) is taken from each.
-4. The **cosine distance** between the two vectors is the variant's score: the larger the distance, the larger the predicted effect.
-5. The scores are evaluated against the binary `label` column with **AUROC**.
+4. The cosine distance between the two vectors is the variant's score: the larger the distance, the larger the predicted effect.
+5. The scores are evaluated against the binary `label` column with AUROC and AUPRC.
 
 No training is involved in the default (zero-shot) setting. Fine-tuning is optional; see [Fine-tuning](#fine-tuning-dnabert-2-with-lora-experimental).
 
@@ -25,8 +25,6 @@ No training is involved in the default (zero-shot) setting. Fine-tuning is optio
 bend/
 ├── __init__.py                  # exposes bend.utils.embedders
 ├── models/                      # model architectures loaded by the embedders
-│   ├── awd_lstm.py              # AWD-LSTM baseline LM (BEND)
-│   ├── dilated_cnn.py           # dilated ConvNet baseline LM (BEND)
 │   ├── dnabert2.py              # DNABERT-2 (local copy, no flash attention)
 │   ├── dnabert2_padding.py      # padding helpers for dnabert2.py
 │   ├── gena_lm.py               # GENA-LM BERT
@@ -34,12 +32,12 @@ bend/
 └── utils/
     ├── embedders.py             # one wrapper class per model, common .embed() interface
     ├── retrieve_from_bed.py     # Annotation: bed file + FASTA -> DNA sequences
-    └── download.py              # download helpers for BEND / Zenodo checkpoints
+    └── download.py              # download helper for Zenodo-hosted checkpoints (GROVER)
 scripts/
 ├── download_bend.py                       # download the BEND data share
 ├── predict_variant_effects.py             # zero-shot variant scoring (main script)
-├── run_variant_effects.sh                 # legacy BEND batch runner (see Known limitations)
-├── fine-tune_variant_effects.py           # LoRA fine-tuning + test AUROC (DNABERT-2)
+├── run_variant_effects.sh                 # runs every model on both BEND variant files
+├── fine-tune_variant_effects.py           # LoRA fine-tuning + test AUROC/AUPRC (DNABERT-2)
 ├── fine-tune_variant_effects_crossval.py  # k-fold version of the fine-tuning (validation loss only)
 └── get_genes.py                           # annotate expression variants with overlapping genes
 ```
@@ -55,7 +53,7 @@ pip install -r requirements.txt
 pip install -e .          # installs the `bend` package in editable mode
 ```
 
-`transformers` is pinned to `<=4.33.3` because the local DNABERT-2, GENA-LM and HyenaDNA code depends on that API.
+`transformers` is pinned to `<=4.33.3` because the local DNABERT-2, GENA-LM and HyenaDNA code depends on that API. `peft` is pinned to `0.10.0` for the same reason: newer versions import `transformers.Cache`, which only exists from transformers 4.36.
 `bend/utils/embedders.py` imports `alphagenome_pytorch` and `peft` at module level, so both must be installed even if you only use another model.
 
 Some scripts and models need packages that are **not** in `requirements.txt`:
@@ -66,7 +64,6 @@ Some scripts and models need packages that are **not** in `requirements.txt`:
 | `scripts/download_bend.py` | `pip install requests beautifulsoup4 lxml` |
 | `scripts/get_genes.py` | `pip install pyranges` |
 | GPN embedder | the `gpn` package |
-| Caduceus embedder | `mamba-ssm==1.2.0.post1` |
 
 **AlphaGenome needs a CUDA GPU**: the embedder moves the model and inputs to `cuda` explicitly. The other embedders fall back to CPU.
 
@@ -96,11 +93,14 @@ A tab-separated `bed` file with a header. `predict_variant_effects.py` needs at 
 | Column | Meaning |
 | --- | --- |
 | `chromosome` | must match the FASTA record names (e.g. `chr1`) |
-| `start`, `end` | 0-based variant coordinates |
+| `start`, `end` | 0-based position of the variant in `start`. Both `end = start + 1` (standard bed, BEND files) and `end = start` (TraitGym files) work |
 | `alt` | alternative allele (single nucleotide) |
 | `label` | 1 = functional / pathogenic, 0 = benign |
+| `ref` | optional: reference allele, used to check the coordinates (see below) |
 
 Any other columns are kept and copied to the output CSV.
+
+If the file has a `ref` column, every script checks that the genome has that base at the variant position. It prints the number of mismatches and stops if more than 5% of the variants do not match. A wrong genome build or an off-by-one in the coordinates raises no other error; it only gives wrong embeddings.
 
 When the genome path is exactly `data/genomes/GRCh37.no-chr.fa`, the `chr` prefix is stripped from the `chromosome` column so it matches that FASTA.
 
@@ -108,7 +108,7 @@ When the genome path is exactly `data/genomes/GRCh37.no-chr.fa`, the `chr` prefi
 
 ```bash
 python scripts/predict_variant_effects.py <bed_file> <run_name> <model> <checkpoint> <genome_fasta> \
-    [--extra_context 1024] [--embedding_idx 1024] [--kmer 6]
+    [--extra_context 1024] [--embedding_idx <variant position>] [--kmer 6]
 ```
 
 Example:
@@ -116,16 +116,23 @@ Example:
 ```bash
 python scripts/predict_variant_effects.py data/variant_effects/variant_effects_disease.bed \
     disease_dnabert2 dnabert2 zhihan1996/DNABERT-2-117M data/genomes/GRCh38.primary_assembly.genome.fa \
-    --extra_context 1024 --embedding_idx 1024
+    --extra_context 1024
 ```
 
-### Choosing `--extra_context` and `--embedding_idx`
+`scripts/run_variant_effects.sh` runs every model on both BEND variant files. Run it from the repository root.
 
-- **Bidirectional models** take `extra_context` nucleotides on each side, and the variant is placed at the centre of the window (`len // 2`). Use `--embedding_idx` equal to `--extra_context`.
-- **Autoregressive models** (`hyenadna`, `awdlstm`) take left context only, and the variant is the **last** nucleotide of the window. Use `--embedding_idx` equal to `--extra_context - 1`.
-- **DNABERT (v1)** embeddings are not upsampled, so the index refers to k-mer tokens. For example, `254` with 6-mers and 256 nucleotides of context puts the variant at the 3rd position of the 6-mer.
+### Windows and embedding index
 
-Any `N` in the window is replaced with `A` before embedding.
+The window around each variant is built so that the variant is always at index `extra_context`:
+
+- **Bidirectional models** get `[start − extra_context, start + extra_context)`, exactly `2 × extra_context` nucleotides.
+- **Autoregressive models** (`hyenadna`) get left context only: `[start − extra_context, start + 1)`, so the variant is the last nucleotide. These models are causal, so the embedding of any position before the variant is identical for both alleles. An index that is off by one would give a distance of exactly 0 for every variant.
+
+`--embedding_idx` defaults to that position, so it only needs to be set for **DNABERT (v1)**. Its embeddings are not upsampled, so the index refers to k-mer tokens: use `extra_context − 2` to take the 6-mer that has the variant at its 3rd position.
+
+**AlphaGenome** downsamples the sequence by powers of 2, so its window length must be a multiple of 2048. Use `--extra_context 1024` (or another multiple of 1024).
+
+The window is converted to upper case (soft-masked genomes have lowercase repeats). Any `N` is then replaced with `A`, and the number of replaced `N`s is printed.
 
 ### Supported models
 
@@ -139,11 +146,7 @@ Any `N` in the window is replaced with `A` before embedding.
 | `grover` | `GROVEREmbedder` | `pretrained_models/grover` | BPE, upsampled |
 | `hyenadna` | `HyenaDNAEmbedder` | `pretrained_models/hyenadna/hyenadna-tiny-1k-seqlen` | autoregressive; needs Git LFS for the download |
 | `dnabert` | `DNABertEmbedder` | `pretrained_models/dnabert/6-new-12w-0` | use `--kmer` |
-| `awdlstm` | `AWDLSTMEmbedder` | `pretrained_models/awd_lstm` | BEND baseline, autoregressive |
-| `convnet` | `ConvNetEmbedder` | `pretrained_models/convnet` | BEND baseline |
 | `gpn` | `GPNEmbedder` | `songlab/gpn-brassicales` | trained on plants, not human |
-
-`bend/utils/embedders.py` also contains `CaduceusEmbedder` and `OneHotEmbedder`, but the scripts do not expose them.
 
 The embedders can also be used directly:
 
@@ -161,8 +164,8 @@ Each run writes to `runs/<model>/<run_name>/`:
 | File | Content |
 | --- | --- |
 | `embeddings_<run_name>.pkl` | one pickled tuple `(index, embedding_ref, embedding_alt)` per variant, written one after another |
-| `cosine_distance_<run_name>.csv` | the input bed (with the extended coordinates) plus a `distance` column |
-| `log.txt` | one line appended per run: timestamp, run name, elapsed time, number of variants, AUROC |
+| `cosine_distance_<run_name>.csv` | the input bed plus a `distance` column; `start` and `end` hold the window coordinates |
+| `log.txt` | one line appended per run: timestamp, run name, elapsed time, number of variants, AUROC (`AUC=`) and AUPRC |
 
 The `.pkl` file holds many sequential pickles, so read it in a loop:
 
@@ -181,15 +184,17 @@ with open('runs/dnabert2/disease_dnabert2/embeddings_disease_dnabert2.pkl', 'rb'
 
 ```bash
 python scripts/fine-tune_variant_effects.py <bed_file> dnabert2 zhihan1996/DNABERT-2-117M <genome_fasta> <batch_size> <epochs> \
-    [--extra_context 256] [--embedding_idx 256]
+    [--extra_context 256] [--max_variants N]
 ```
 
+- `--max_variants` uses only the first N variants, for quick tests. All variants are used by default.
+- The window and embedding index are built as in the zero-shot script.
 - Only `DNABert2Embedder` implements the methods the fine-tuning needs (`prepare_for_finetuning` and `training_embed`). The other choices in the argument list fail.
 - LoRA adapters (r = 8, alpha = 16, dropout = 0.1) are added to the `Wqkv` and `attention.output.dense` layers. Training uses AdamW with lr = 1e-5.
 - The loss is contrastive on the cosine distance *d* between the reference and alternative embeddings: `label · max(0, margin − d)² + (1 − label) · d²`, with margin = 10. It pushes benign pairs together and functional pairs apart.
-- The data is split 64 / 16 / 20 (train / validation / test), stratified by label with seed 42. After training, the test AUROC is computed with the same cosine distance score as the zero-shot script.
+- The data is split 64 / 16 / 20 (train / validation / test), stratified by label with seed 42. After training, the test AUROC and AUPRC are computed with the same cosine distance score as the zero-shot script.
 
-`fine-tune_variant_effects_crossval.py` runs the same training with `StratifiedKFold` (`--n_folds`, default 5) and reports the mean ± standard deviation of the best validation loss. It does not compute a test AUROC.
+`fine-tune_variant_effects_crossval.py` runs the same training with `StratifiedKFold` (`--n_folds`, default 5) and reports the mean ± standard deviation of the best validation loss. It does not compute a test AUROC or AUPRC.
 
 ## Gene annotation
 
@@ -202,9 +207,9 @@ python scripts/fine-tune_variant_effects.py <bed_file> dnabert2 zhihan1996/DNABE
 
 This is a work in progress:
 
-- Both fine-tuning scripts currently use only the **first 100 variants** (debug subset).
-- In `fine-tune_variant_effects_crossval.py`, every fold builds its train and validation loaders from the full dataset and ignores the fold indices. The `--out_dir` option is not used yet.
-- `run_variant_effects.sh` is BEND's original batch script. It passes paths as `out_file` (the current script expects a run name), relies on the old default `--extra_context 256` while the default is now 1024, and does not include AlphaGenome or Borzoi.
+- In the contrastive loss, the margin (10) is larger than the maximum cosine distance (2). The functional-variant term therefore never reaches zero, and the loss stays around 40–50.
+- The `--out_dir` option of `fine-tune_variant_effects_crossval.py` is not used yet, so no checkpoints are saved.
+- The automatic checkpoint downloads use Linux commands (`wget` for GROVER; `rm`, `mkdir -p` and `git lfs` for HyenaDNA). On other systems, download the checkpoints manually into `pretrained_models/`.
 
 ## Acknowledgements and citation
 

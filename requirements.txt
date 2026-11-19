@@ -7,7 +7,8 @@ torchvision
 tqdm>=4.65.0
 transformers>=4.30.1,<=4.33.3
 einops
-peft
+peft==0.10.0
 alphagenome-pytorch
 huggingface_hub
 pyarrow
+omegaconf
