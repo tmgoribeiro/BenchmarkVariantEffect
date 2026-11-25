@@ -1,18 +1,13 @@
 '''
-AUROC and AUPRC of the cosine distances, over all variants and per consequence class.
-
-Reads the csv files written by predict_variant_effects.py (cosine_distance_<out_file>.csv) or by
-predict_variant_effects_pooling_strategies.py (pooling_strategies/<strategy>_<out_file>.csv). Every
-column whose name starts with "distance" is scored, unless --columns is given.
-
-    python scripts/scripts_metrics/calculate_cosine_metrics.py runs/dnabert2/disease_dnabert2/cosine_distance_disease_dnabert2.csv
+AUROC and AUPRC of every distance column of the given csv files, overall and per consequence class.
 '''
 import argparse
+from pathlib import Path
 
 import pandas as pd
 from sklearn.metrics import roc_auc_score, average_precision_score
 
-from count_consequences import read_table, find_consequence_column
+from bend.utils.metrics_utils import read_table, find_consequence_column, resolve_run, results_dir, save_results
 
 
 def scores(labels: pd.Series, distances: pd.Series) -> dict:
@@ -41,10 +36,13 @@ def main():
     parser.add_argument('files', type=str, nargs='+', help='csv files written by the prediction scripts')
     parser.add_argument('--columns', type=str, nargs='+', default=None, help='Score columns. Defaults to every column starting with "distance"')
     parser.add_argument('--consequence_column', type=str, default=None, help='Name of the consequence column. Defaults to the column called consequence (any case)')
+    parser.add_argument('--model', type=str, default=None, help='Model folder of the results. Defaults to the model in the path of each csv')
+    parser.add_argument('--dataset', type=str, default=None, help='Dataset folder of the results. Defaults to the dataset in the path of each csv')
 
     args = parser.parse_args()
 
     for path in args.files:
+        model, dataset = resolve_run(parser, path, args.model, args.dataset)
         df = read_table(path)
         score_columns = args.columns if args.columns is not None else [c for c in df.columns if c.startswith('distance')]
         consequence_column = find_consequence_column(df, args.consequence_column)
@@ -53,10 +51,17 @@ def main():
         if consequence_column is None:
             print('No consequence column, only the overall scores are shown')
 
+        tables, log = [], {'file': path}
         for score_column in score_columns:
             table = scores_table(df, score_column, consequence_column)
             print(f'\n{score_column}  (classes with only positives or only negatives have no score)')
             print(table.to_string(float_format='{:.4f}'.format))
+            tables.append(table.rename_axis('consequence').reset_index().assign(score=score_column))
+            log[f'AUC_{score_column}'] = f"{table.loc['all', 'AUC']:.4f}"
+            log[f'AUPRC_{score_column}'] = f"{table.loc['all', 'AUPRC']:.4f}"
+
+        results = pd.concat(tables)[['score', 'consequence', 'n', 'positives', 'AUC', 'AUPRC']]
+        save_results(results_dir(__file__, model, dataset), Path(path).stem, results, [log])
 
 
 if __name__ == '__main__':

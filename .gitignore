@@ -168,4 +168,5 @@ cython_debug/
 *.csv
 
 runs/
+results/
 embeddings/

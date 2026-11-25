@@ -1,27 +1,11 @@
 '''
-List the consequence classes of one or more variant datasets, with the number of variants and of
-positives (label = 1) in each class.
-
-    python scripts/scripts_metrics/count_consequences.py data/variant_effects/variant_effects_disease.bed data/variant_effects/variant_effects_expression.bed
+Number of variants and positives per consequence class of one or more datasets.
 '''
 import argparse
-from pathlib import Path
 
 import pandas as pd
 
-
-def read_table(path: str) -> pd.DataFrame:
-    '''Bed files are tab-separated; the csv files of the prediction scripts are comma-separated with the index first.'''
-    if Path(path).suffix == '.csv':
-        return pd.read_csv(path, index_col=0)
-    return pd.read_csv(path, sep='\t')
-
-
-def find_consequence_column(df: pd.DataFrame, column: str = None) -> str:
-    '''Name of the consequence column, or None if there is none.'''
-    if column is not None:
-        return column if column in df.columns else None
-    return next((c for c in df.columns if c.lower() == 'consequence'), None)
+from bend.utils.metrics_utils import read_table, find_consequence_column, infer_run, dataset_name, results_dir, save_results
 
 
 def consequence_counts(df: pd.DataFrame, column: str) -> pd.DataFrame:
@@ -49,6 +33,11 @@ def main():
         counts = consequence_counts(df, column)
         print(f'\n{path}: {len(df)} variants, {int(df["label"].sum())} positive, {len(counts)} consequence classes')
         print(counts.to_string())
+
+        dataset = infer_run(path)[1] or dataset_name(path)
+        log = {'file': path, 'n_variants': len(df), 'positives': int(df['label'].sum()), 'n_classes': len(counts),
+               'classes': ','.join(map(str, counts.index))}
+        save_results(results_dir(__file__, None, dataset), 'consequences', counts.reset_index(), [log])
 
 
 if __name__ == '__main__':

@@ -7,7 +7,6 @@
 # Copyright (c) 2022, Tri Dao.
 
 import copy
-import logging
 import math
 import warnings
 from typing import List, Optional, Tuple, Union
@@ -15,22 +14,13 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from einops import rearrange
-from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
 from transformers.activations import ACT2FN
-from transformers.modeling_outputs import (MaskedLMOutput,
-                                           SequenceClassifierOutput)
+from transformers.modeling_outputs import MaskedLMOutput
 from transformers.models.bert.modeling_bert import BertPreTrainedModel
 
 from .dnabert2_padding import (index_first_axis,
                                             index_put_first_axis, pad_input,
                                             unpad_input, unpad_input_only)
-
-try:
-    from .flash_attn_triton import flash_attn_qkvpacked_func
-except ImportError as e:
-    flash_attn_qkvpacked_func = None
-
-logger = logging.getLogger(__name__)
 
 
 class BertEmbeddings(nn.Module):
@@ -121,19 +111,12 @@ class BertUnpadSelfAttention(nn.Module):
         self.p_dropout = config.attention_probs_dropout_prob
         self.Wqkv = nn.Linear(self.all_head_size, 3 * config.hidden_size)
 
-        # Warn if defaulting to pytorch because of import issues
-        if flash_attn_qkvpacked_func is None:
-            warnings.warn(
-                'Unable to import Triton; defaulting MosaicBERT attention implementation to pytorch (this will reduce throughput when using this model).'
-            )
-
     def forward(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor,
                 max_seqlen_in_batch: int, indices: torch.Tensor,
                 attn_mask: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
         """Perform self-attention.
 
-        If dropout is zero, then we can use the Triton kernel, so we do that. However, if not, we send through a standard PyTorch
-        implementation of self-attention.
+        Attention is computed in PyTorch (this copy of the model does not include the Triton flash attention kernel).
 
         The arguments are unpadded, and our implementations of attention require padded arguments,
         so we first call `pad_input`. Once we compute attention, we re-unpad our outputs for the other layers.
@@ -158,32 +141,16 @@ class BertUnpadSelfAttention(nn.Module):
                         'b s (t h d) -> b s t h d',
                         t=3,
                         h=self.num_attention_heads)
-        if self.p_dropout or flash_attn_qkvpacked_func is None:
-            # if we have nonzero attention dropout (e.g. during fine-tuning) or no Triton, compute attention in PyTorch
-            q = qkv[:, :, 0, :, :].permute(0, 2, 1, 3)  # b h s d
-            k = qkv[:, :, 1, :, :].permute(0, 2, 3, 1)  # b h d s
-            v = qkv[:, :, 2, :, :].permute(0, 2, 1, 3)  # b h s d
-            attention_scores = torch.matmul(q, k) / math.sqrt(
-                self.attention_head_size)
-            attention_scores = attention_scores + bias
-            attention_probs = nn.functional.softmax(attention_scores, dim=-1)
-            attention_probs = self.dropout(attention_probs)
-            attention = torch.matmul(attention_probs, v).permute(0, 2, 1,
-                                                                 3)  # b s h d
-        else:
-            # Triton implementation only supports 0 attention dropout
-            convert_dtype = qkv.dtype not in [torch.float16, torch.bfloat16]
-            if convert_dtype:
-                # Triton implementation only supports fp16 and bf16
-                orig_dtype = qkv.dtype
-                qkv = qkv.to(torch.float16)
-                bias_dtype = bias.dtype
-                bias = bias.to(torch.float16)
-                attention = flash_attn_qkvpacked_func(qkv, bias)
-                attention = attention.to(orig_dtype)
-                bias = bias.to(bias_dtype)
-            else:
-                attention = flash_attn_qkvpacked_func(qkv, bias)
+        q = qkv[:, :, 0, :, :].permute(0, 2, 1, 3)  # b h s d
+        k = qkv[:, :, 1, :, :].permute(0, 2, 3, 1)  # b h d s
+        v = qkv[:, :, 2, :, :].permute(0, 2, 1, 3)  # b h s d
+        attention_scores = torch.matmul(q, k) / math.sqrt(
+            self.attention_head_size)
+        attention_scores = attention_scores + bias
+        attention_probs = nn.functional.softmax(attention_scores, dim=-1)
+        attention_probs = self.dropout(attention_probs)
+        attention = torch.matmul(attention_probs, v).permute(0, 2, 1,
+                                                             3)  # b s h d
 
         # attn_mask is 1 for attend and 0 for don't
         attention = unpad_input_only(attention, torch.squeeze(attn_mask) == 1)
@@ -670,18 +637,6 @@ class BertOnlyMLMHead(nn.Module):
         return prediction_scores
 
 
-class BertOnlyNSPHead(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        self.seq_relationship = nn.Linear(config.hidden_size, 2)
-
-    def forward(self, pooled_output: torch.Tensor) -> torch.Tensor:
-        seq_relationship_score = self.seq_relationship(pooled_output)
-        return seq_relationship_score
-
-
-
 class BertForMaskedLM(BertPreTrainedModel):
 
     def __init__(self, config):
@@ -810,106 +765,3 @@ class BertForMaskedLM(BertPreTrainedModel):
         return {'input_ids': input_ids, 'attention_mask': attention_mask}
 
 
-class BertForNextSentencePrediction(BertPreTrainedModel):
-    #TBD: Push in future commit
-    pass
-
-
-class BertForSequenceClassification(BertPreTrainedModel):
-    """Bert Model transformer with a sequence classification/regression head.
-
-    This head is just a linear layer on top of the pooled output. Used for,
-    e.g., GLUE tasks.
-    """
-
-    def __init__(self, config):
-        super().__init__(config)
-        self.num_labels = config.num_labels
-        self.config = config
-
-        self.bert = BertModel(config)
-        classifier_dropout = (config.classifier_dropout
-                              if config.classifier_dropout is not None else
-                              config.hidden_dropout_prob)
-        self.dropout = nn.Dropout(classifier_dropout)
-        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
-
-        # Initialize weights and apply final processing
-        self.post_init()
-
-
-    def forward(
-        self,
-        input_ids: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        token_type_ids: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        head_mask: Optional[torch.Tensor] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        labels: Optional[torch.Tensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple[torch.Tensor], SequenceClassifierOutput]:
-        # labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-        # Labels for computing the sequence classification/regression loss.
-        # Indices should be in `[0, ..., config.num_labels - 1]`.
-        # If `config.num_labels == 1` a regression loss is computed
-        # (mean-square loss). If `config.num_labels > 1` a classification loss
-        # is computed (cross-entropy).
-
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        outputs = self.bert(
-            input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            head_mask=head_mask,
-            inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-
-        pooled_output = outputs[1]
-
-        pooled_output = self.dropout(pooled_output)
-        logits = self.classifier(pooled_output)
-
-        loss = None
-        if labels is not None:
-            # Compute loss
-            if self.config.problem_type is None:
-                if self.num_labels == 1:
-                    self.config.problem_type = 'regression'
-                elif self.num_labels > 1 and (labels.dtype == torch.long or
-                                              labels.dtype == torch.int):
-                    self.config.problem_type = 'single_label_classification'
-                else:
-                    self.config.problem_type = 'multi_label_classification'
-
-            if self.config.problem_type == 'regression':
-                loss_fct = nn.MSELoss()
-                if self.num_labels == 1:
-                    loss = loss_fct(logits.squeeze(), labels.squeeze())
-                else:
-                    loss = loss_fct(logits, labels)
-            elif self.config.problem_type == 'single_label_classification':
-                loss_fct = nn.CrossEntropyLoss()
-                loss = loss_fct(logits.view(-1, self.num_labels),
-                                labels.view(-1))
-            elif self.config.problem_type == 'multi_label_classification':
-                loss_fct = nn.BCEWithLogitsLoss()
-                loss = loss_fct(logits, labels)
-
-        if not return_dict:
-            output = (logits,) + outputs[2:]
-            return ((loss,) + output) if loss is not None else output
-
-        return SequenceClassifierOutput(
-            loss=loss,
-            logits=logits,
-            hidden_states=outputs[0],
-            attentions=None,
-        )

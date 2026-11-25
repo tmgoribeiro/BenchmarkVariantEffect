@@ -1,84 +1,105 @@
+'''
+Random forest on the embeddings of one model, tested on held-out groups of chromosomes.
+Uses cuML on the GPU when it is installed.
+'''
 import argparse
+
 import numpy as np
 import pandas as pd
-from sklearn.metrics import roc_auc_score, average_precision_score
-import pickle
-from cuml.ensemble import RandomForestClassifier
-from sklearn.metrics import log_loss
+from sklearn.metrics import roc_auc_score, average_precision_score, log_loss
 
-def load_emb(path):
-    with open(path, "rb") as f:
-        obj = pickle.load(f)
-    if isinstance(obj, pd.DataFrame):
-        return obj.select_dtypes("number").values
-    if isinstance(obj, dict):  # e.g. {"embeddings": ..., "labels": ...} or {id: vec}
-        # adjust the key if needed
-        obj = obj["embeddings"] if "embeddings" in obj else np.stack(list(obj.values()))
-    return np.asarray(obj)
- 
+try:
+    from cuml.ensemble import RandomForestClassifier
+    BACKEND = 'cuml'
+except ImportError:
+    from sklearn.ensemble import RandomForestClassifier
+    BACKEND = 'sklearn'
+
+from bend.utils.metrics_utils import (add_single_model_args, single_model_paths, load_pairs, load_annotation,
+                                      build_features, mean_std, print_summary, results_dir, save_results,
+                                      summary_fields)
 
 
-p = argparse.ArgumentParser()
-p.add_argument("--n_estimators", type=int, default=500)
-p.add_argument("--max_depth", type=int, default=8)
-p.add_argument("--seed", type=int, default=42)
-args = p.parse_args()
- 
-# ---- load data --
-ref = load_emb("../../embeddings/ref_embeddings_disease_dnabert2_512.pkl")
-alt = load_emb("../../embeddings/alt_embeddings_disease_dnabert2_512.pkl")
-label_df = pd.read_csv("../../data/variant_effects/variant_effects_disease.bed", sep="\t")
-LABEL_COL = "label"  # adjust to the label column name in the .bed
-
-assert ref.shape == alt.shape and len(ref) == len(label_df), (
-    f"ref={ref.shape} alt={alt.shape} labels={len(label_df)}"
-)
-print(f"ref={ref.shape} alt={alt.shape} labels={len(label_df)}")
-
-X = ((alt + ref)/2).astype(np.float32)
-y_raw = label_df[LABEL_COL].values
-
-classes, y = np.unique(y_raw, return_inverse=True)
-n_classes = len(classes)
-print(f"X: {X.shape} | classes: {n_classes} {dict(zip(classes, np.bincount(y)))}")
- 
-chrom = label_df["chromosome"].astype(str).str.replace("chr", "").values
-test_groups = [
-    {"3","6","9","12","16","18","19","21"},
-    {"2","5","11","14","17","20","22","X"},
-    {"1","4","7","8","10","13","15"},
+# chromosomes held out together in each fold (without the chr prefix)
+TEST_GROUPS = [
+    {'3', '6', '9', '12', '16', '18', '19', '21'},
+    {'2', '5', '11', '14', '17', '20', '22', 'X'},
+    {'1', '4', '7', '8', '10', '13', '15'},
 ]
 
-aucs = []
-auprcs = []
 
-for g, test_set in enumerate(test_groups, 1):
+def chromosome_holdout(X, y, chrom, args):
+    '''AUROC, AUPRC, chance AUPRC and validation loss of each chromosome group.'''
+    rows = []
+    for g, test_set in enumerate(TEST_GROUPS, 1):
+        in_test = np.isin(chrom, list(test_set))
+        te, tr = np.where(in_test)[0], np.where(~in_test)[0]
+        if len(np.unique(y[te])) < 2 or len(np.unique(y[tr])) < 2:
+            print(f'Group {g}: skipped, its test or training variants do not have both labels (n_test = {len(te)})')
+            continue
 
-    te = np.where(np.isin(chrom, list(test_set)))[0]
-    tr = np.where(~np.isin(chrom, list(test_set)))[0]
+        kwargs = {} if BACKEND == 'cuml' else {'n_jobs': -1}
+        clf = RandomForestClassifier(n_estimators=args.n_estimators, max_depth=args.max_depth,
+                                     random_state=args.seed, **kwargs)
+        clf.fit(X[tr], y[tr])
+        probs = clf.predict_proba(X[te])
+        probs = probs.get() if hasattr(probs, 'get') else np.asarray(probs)  # cupy -> numpy
+        probs = probs[:, 1]
 
-    clf = RandomForestClassifier(
-        n_estimators=args.n_estimators,
-        max_depth=args.max_depth,
-        random_state=args.seed,
-    )
-    clf.fit(X[tr], y[tr])
+        rows.append({'group': g, 'chromosomes': ','.join(sorted(test_set, key=lambda c: (not c.isdigit(), c.zfill(2)))),
+                     'n_test': len(te), 'AUC': roc_auc_score(y[te], probs),
+                     'AUPRC': average_precision_score(y[te], probs), 'chance_AUPRC': y[te].mean(),
+                     'val_loss': log_loss(y[te], probs, labels=[0, 1])})
+        r = rows[-1]
+        print(f"Group {g}: AUC = {r['AUC']:.4f} | AUPRC = {r['AUPRC']:.4f} | baseline = {r['chance_AUPRC']:.4f} | "
+              f"val loss = {r['val_loss']:.4f} | n_test = {r['n_test']}")
+    return rows
 
-    probs = clf.predict_proba(X[te])
-    probs = probs.get() if hasattr(probs, "get") else np.asarray(probs)  # cupy -> numpy if needed
-    if n_classes == 2:
-        probs_auc = probs[:, 1]
-    else:
-        probs_auc = probs
 
-    fold_auc = roc_auc_score(y[te], probs_auc)
-    fold_auprc = average_precision_score(y[te], probs_auc)
+def main():
 
-    val_loss = log_loss(y[te], probs, labels=np.arange(n_classes))
+    parser = argparse.ArgumentParser('Random forest on the variant embeddings of one model, with chromosome holdout')
+    add_single_model_args(parser, default_features=['avg'])
+    parser.add_argument('--n_estimators', type=int, default=500)
+    parser.add_argument('--max_depth', type=int, default=8)
+    parser.add_argument('--seed', type=int, default=42)
+    args = parser.parse_args()
 
-    aucs.append(fold_auc)
-    auprcs.append(fold_auprc)
-    print(f"Group {g}: AUC = {fold_auc:.4f} | AUPRC = {fold_auprc:.4f} | baseline = {y[te].mean():.4f} | n_test = {len(te)}")
+    emb_path, labels_path = single_model_paths(parser, args)
 
-print(f"\nMean AUC:   {np.mean(aucs):.4f} ± {np.std(aucs):.4f}")
-print(f"Mean AUPRC: {np.mean(auprcs):.4f} ± {np.std(auprcs):.4f}")
+    idx, ref, alt = load_pairs(emb_path)
+    annotation = load_annotation(labels_path, idx)
+    y = annotation['label'].to_numpy()
+    chrom = annotation['chromosome'].astype(str).str.replace('chr', '').to_numpy()
+    print(f'Embeddings: {emb_path}')
+    print(f'Labels:     {labels_path}')
+    print(f'{len(y)} variants ({y.sum()} positive) | embedding size {ref.shape[1]} | random forest: {BACKEND}')
+
+    never_tested = ~np.isin(chrom, list(set().union(*TEST_GROUPS)))
+    if never_tested.any():
+        print(f'{never_tested.sum()} variants on chromosomes outside every test group '
+              f'({sorted(set(chrom[never_tested]))}), they are only used for training')
+
+    summary, all_rows, log_fields = {}, [], []
+    for feature in args.features:
+        X = build_features(ref, alt, feature)
+        print(f'\n=== features: {feature} | X: {X.shape}')
+        rows = chromosome_holdout(X, y, chrom, args)
+        if not rows:
+            parser.error('No chromosome group has both labels among its variants, nothing to evaluate')
+
+        summary[feature] = {'AUC': mean_std([r['AUC'] for r in rows]), 'AUPRC': mean_std([r['AUPRC'] for r in rows])}
+        print(f"Mean AUC: {summary[feature]['AUC']} | Mean AUPRC: {summary[feature]['AUPRC']}")
+        all_rows += [{'features': feature, **r} for r in rows]
+        log_fields.append({'out_file': args.out_file, 'pooling': args.pooling, 'features': feature,
+                           'embeddings': emb_path, **summary_fields(rows, y), 'n_estimators': args.n_estimators,
+                           'max_depth': args.max_depth, 'seed': args.seed, 'backend': BACKEND})
+
+    print_summary(f'Random forest, chromosome holdout | {args.model} | {args.dataset} | {args.out_file} | {args.pooling}'
+                  f' (AUPRC of a random classifier: {y.mean():.4f})', summary)
+    save_results(results_dir(__file__, args.model, args.dataset), f'{args.out_file}_{args.pooling}',
+                 pd.DataFrame(all_rows), log_fields)
+
+
+if __name__ == '__main__':
+    main()

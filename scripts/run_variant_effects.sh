@@ -1,10 +1,5 @@
 #!/bin/bash
-# Runs the zero-shot variant effect prediction for every model on both BEND variant files.
-# For each model, we extract the cosine distance between the reference and mutated sequence embedding.
-# Run from the repository root. Results go to runs/<model>/<run_name>/.
-#
-# The embedding index defaults to the position of the variant in the window, so --embedding_idx
-# only has to be set for DNABERT (v1), whose embeddings are per k-mer token.
+# Runs predict_variant_effects.py for every model on both BEND variant files; run it from the repository root.
 # A model that fails does not stop the others.
 
 GENOME=data/genomes/GRCh38.primary_assembly.genome.fa
@@ -28,8 +23,6 @@ run_all () {
     python3 scripts/predict_variant_effects.py $VARIANT_FILE ${PREFIX}_hyenadna_medium160k hyenadna pretrained_models/hyenadna/hyenadna-medium-160k-seqlen $GENOME --extra_context $CAUSAL_CONTEXT
     python3 scripts/predict_variant_effects.py $VARIANT_FILE ${PREFIX}_hyenadna_medium450k hyenadna pretrained_models/hyenadna/hyenadna-medium-450k-seqlen $GENOME --extra_context $CAUSAL_CONTEXT
     python3 scripts/predict_variant_effects.py $VARIANT_FILE ${PREFIX}_hyenadna_large1m hyenadna pretrained_models/hyenadna/hyenadna-large-1m-seqlen $GENOME --extra_context $CAUSAL_CONTEXT
-    python3 scripts/predict_variant_effects.py $VARIANT_FILE ${PREFIX}_genalm_bert_large_t2t genalm AIRI-Institute/gena-lm-bert-large-t2t $GENOME --extra_context $CONTEXT
-    python3 scripts/predict_variant_effects.py $VARIANT_FILE ${PREFIX}_genalm_bigbird_base_t2t genalm AIRI-Institute/gena-lm-bigbird-base-t2t $GENOME --extra_context $CONTEXT
     python3 scripts/predict_variant_effects.py $VARIANT_FILE ${PREFIX}_grover grover pretrained_models/grover $GENOME --extra_context $CONTEXT
     python3 scripts/predict_variant_effects.py $VARIANT_FILE ${PREFIX}_borzoi borzoi johahi/borzoi-replicate-0 $GENOME --extra_context $CONTEXT
     python3 scripts/predict_variant_effects.py $VARIANT_FILE ${PREFIX}_ag ag pretrained_models/alphagenome/model_all_folds.safetensors $GENOME --extra_context $AG_CONTEXT

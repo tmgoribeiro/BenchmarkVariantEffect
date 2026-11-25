@@ -1,9 +1,5 @@
 '''
-Download a TraitGym dataset (https://huggingface.co/datasets/songlab/TraitGym) and convert it to the
-bed format used by predict_variant_effects.py.
-
-TraitGym gives 1-based positions on GRCh38, while predict_variant_effects.py reads 0-based coordinates.
-Writing start == end gives windows of exactly 2 * extra_context bp, with the variant at index extra_context.
+Download a TraitGym dataset from Hugging Face and convert it to a bed file (0-based, start == end).
 '''
 import argparse
 from pathlib import Path

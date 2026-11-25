@@ -10,9 +10,8 @@ Example
 ``get_dna.get_dna_segment(index = 0) # will return the dna segment for index 0 in the annotation file``
 
 '''
-from Bio import SeqIO
 import pandas as pd
-
+from Bio import SeqIO
 
 
 class Annotation:
@@ -32,11 +31,6 @@ class Annotation:
             The default is None.
 
         """
-        # '''
-        # Return a dna sequence from a bed file and a reference genome
-        # annotation: path to bed file
-        # reference_genome: path to reference genome fasta file
-        # '''
         if annotation is not None:
             if isinstance(annotation, str):
                 annotation = pd.read_csv(annotation, sep = '\t')
@@ -47,7 +41,6 @@ class Annotation:
 
     
     def extend_segments(self, extra_context_left: int = None, extra_context_right: int = None, extra_context: int = None) -> None:
-        # '''Modify the annotation to include extra context on both sides of the segments'''
         """
         Add extra context to the coordinates in the annotation file.
         Each sample in the annotation file will be extended by extra_context_left and extra_context_right.
@@ -116,8 +109,6 @@ class Annotation:
             The geomic DNA sequence of the segment.
         """
 
-
-        
         item = self.get_item(index)
 
         # get dna segment from genome dict
@@ -152,10 +143,11 @@ class Annotation:
             print('No ref column in the bed file, skipping the reference allele check')
             return 0
 
-        mismatches = sum(
-            self.get_dna_segment(index=i)[variant_idx].upper() != str(ref).upper()
-            for i, ref in enumerate(self.annotation['ref'])
-        )
+        def matches(i, ref):
+            segment = self.get_dna_segment(index=i)  # shorter than expected past the end of the chromosome
+            return len(segment) > variant_idx and segment[variant_idx].upper() == str(ref).upper()
+
+        mismatches = sum(not matches(i, ref) for i, ref in enumerate(self.annotation['ref']))
         print(f'Reference allele check: {mismatches} of {len(self.annotation)} variants do not match the genome')
         if mismatches > max_mismatch_fraction * len(self.annotation):
             raise ValueError(f'More than {max_mismatch_fraction:.0%} of the reference alleles do not match the genome at the variant position. '

@@ -13,26 +13,20 @@ Original file is located at
 """
 
 #@title Imports
-# for HyenaDNA specifically
-import torch
+import json
 import math
+import os
+import re
+import subprocess
+from functools import partial
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Union
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from functools import partial
 from einops import rearrange
-from typing import Optional
-from functools import partial
-from torch import Tensor
 from torchvision.ops import StochasticDepth
-from collections import namedtuple
-import numpy as np
-import os
-import json
-from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Union
-import re
-import subprocess
 
 from transformers.tokenization_utils import AddedToken, PreTrainedTokenizer
 from transformers import PreTrainedModel
@@ -63,10 +57,6 @@ def fftconv(u, k, D):
     out = y + u * D.unsqueeze(-1)
     return out.to(dtype=u.dtype)
 
-
-@torch.jit.script
-def mul_sum(q, y):
-    return (q * y).sum(dim=1)
 
 class OptimModule(nn.Module):
     """ Interface for Module that allows registering buffers/parameters with configurable optimizer hyperparameters """
@@ -799,13 +789,6 @@ class SequenceDecoder(nn.Module):
         elif self.mode == "first":
             restrict = lambda x: x[..., :l_output, :]
         elif self.mode == "pool":
-            restrict = lambda x: (
-                torch.cumsum(x, dim=-2)
-                / torch.arange(
-                    1, 1 + x.size(-2), device=x.device, dtype=x.dtype
-                ).unsqueeze(-1)
-            )[..., -l_output:, :]
-
             def restrict(x):
                 L = x.size(-2)
                 s = x.sum(dim=-2, keepdim=True)
@@ -947,7 +930,6 @@ This is heavily inspired from CanineTokenizer in transformers package.
 """
 
 
-
 class CharacterTokenizer(PreTrainedTokenizer):
     def __init__(self, characters: Sequence[str], model_max_length: int, padding_side: str='left', **kwargs):
         """Character tokenizer for Hugging Face transformers.
@@ -969,7 +951,6 @@ class CharacterTokenizer(PreTrainedTokenizer):
         self.characters = characters
         self.model_max_length = model_max_length
         bos_token = AddedToken("[BOS]", lstrip=False, rstrip=False)
-        eos_token = AddedToken("[SEP]", lstrip=False, rstrip=False)
         sep_token = AddedToken("[SEP]", lstrip=False, rstrip=False)
         cls_token = AddedToken("[CLS]", lstrip=False, rstrip=False)
         pad_token = AddedToken("[PAD]", lstrip=False, rstrip=False)
@@ -1084,7 +1065,6 @@ class CharacterTokenizer(PreTrainedTokenizer):
             cfg = json.load(f)
         return cls.from_config(cfg)
     
-
 
 
 # from huggingface.py

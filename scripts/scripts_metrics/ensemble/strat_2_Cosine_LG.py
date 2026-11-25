@@ -1,40 +1,52 @@
+'''
+Ensemble 2: logistic regression on the distances of several models, with k-fold cross-validation.
+'''
+import argparse
+
 import pandas as pd
-from scipy import spatial
-from sklearn.metrics import roc_auc_score
-import numpy as np
-from sklearn.model_selection import StratifiedKFold
 from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import roc_auc_score, average_precision_score
+from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
-#separar por consequence
-dnabert2_df =  pd.read_csv('../../runs/dnabert2/expression_dnabert2/cosine_distance_expression_dnabert2.csv')
-grover_df =  pd.read_csv('../../runs/grover/expression_grover/cosine_distance_expression_grover.csv')
-hyenadna_df =  pd.read_csv('../../runs/hyenadna/expression_hyenadna/cosine_distance_expression_hyenadna.csv')
-alphagenome_df =  pd.read_csv('../../runs/alphagenome/expression_ag/cosine_distance_expression_ag.csv')
+from bend.utils.metrics_utils import (add_ensemble_args, score_name, load_ensemble_scores, mean_std, results_dir,
+                                      save_results, summary_fields)
 
 
-dfs = {
-    "dnabert2": dnabert2_df,
-    "grover": grover_df,
-    "hyena": hyenadna_df,
-    "ag": alphagenome_df,
-}
+def main():
 
-X = np.column_stack([d["distance"].values for d in dfs.values()]) 
+    parser = argparse.ArgumentParser('Ensemble: logistic regression on the distances of several models')
+    add_ensemble_args(parser, default_models=['dnabert2', 'grover', 'hyenadna', 'ag'])
+    parser.add_argument('--score', type=score_name, default='cosine_distance', help='Distance of each model: cosine_distance, avg_n{n}, ccs_n{n} or cls')
+    parser.add_argument('--folds', type=int, default=5)
+    parser.add_argument('--C', type=float, default=1.0, help='Inverse regularisation strength of the logistic regression')
+    parser.add_argument('--seed', type=int, default=42)
+    args = parser.parse_args()
 
-label_df = pd.read_csv("../../data/variant_effects/variant_effects_expression.bed", sep="\t")
-LABEL_COL = "label"  # adjust to the label column name in the .bed
-y_raw = label_df[LABEL_COL].values
-classes, y = np.unique(y_raw, return_inverse=True)
+    scores, y, out_files = load_ensemble_scores(parser, args)
+    X = scores.to_numpy()
+    print(f'{len(y)} variants ({y.sum()} positive) | weights in the order {list(scores.columns)}\n')
 
-skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    skf = StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=args.seed)
+    rows = []
+    for fold, (tr, te) in enumerate(skf.split(X, y), 1):
+        stacker = make_pipeline(StandardScaler(), LogisticRegression(C=args.C)).fit(X[tr], y[tr])
+        s = stacker.decision_function(X[te])  # the stacker's logit
+        weights = dict(zip(scores.columns, stacker[-1].coef_[0]))
+        rows.append({'fold': fold, 'AUC': roc_auc_score(y[te], s), 'AUPRC': average_precision_score(y[te], s),
+                     **{f'weight_{m}': w for m, w in weights.items()}, 'bias': stacker[-1].intercept_[0]})
+        print(f"Fold {fold}: AUC = {rows[-1]['AUC']:.4f} | AUPRC = {rows[-1]['AUPRC']:.4f} | "
+              f"weights: {stacker[-1].coef_[0].round(3)} | bias: {stacker[-1].intercept_.round(3)}")
 
-stack_aucs = []
-for fold, (tr, te) in enumerate(skf.split(X, y), 1):
-    meta = make_pipeline(StandardScaler(), LogisticRegression(C=1)).fit(X[tr], y[tr])
-    scores = meta.decision_function(X[te])   # the stacker's logit, (n_te,)
-    stack_aucs.append(roc_auc_score(y[te], scores))
-    print("weights:", meta[-1].coef_.round(3), "bias:", meta[-1].intercept_.round(3))
+    print(f'\n=== Logistic regression on distances | {args.dataset} | {args.score}')
+    print(f"AUC:   {mean_std([r['AUC'] for r in rows])}")
+    print(f"AUPRC: {mean_std([r['AUPRC'] for r in rows])} (AUPRC of a random classifier: {y.mean():.4f})")
 
-print(f"stacker: {np.mean(stack_aucs):.4f} ± {np.std(stack_aucs):.4f}")
+    log = {'out_files': '+'.join(out_files), 'score': args.score, **summary_fields(rows, y),
+           'folds': args.folds, 'C': args.C, 'seed': args.seed}
+    save_results(results_dir(__file__, args.models, args.dataset), args.score, pd.DataFrame(rows), [log])
+
+
+if __name__ == '__main__':
+    main()

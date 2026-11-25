@@ -1,21 +1,10 @@
 '''
-Same variant scoring as predict_variant_effects.py (reference vs. alternative sequence, cosine distance
-between their embeddings), but comparing several ways of pooling the embeddings around the variant:
-
-- cosine_distance: the embedding at the variant position only (the score of predict_variant_effects.py);
-- avg_n{n}:        cosine distance between the mean embeddings of the positions [idx - n, idx + n];
-- ccs_n{n}:        sum of the per-position cosine distances over [idx - n, idx + n];
-- cls:             cosine distance between the [CLS] embeddings (only for models that have a [CLS] token).
-
-Results go to runs/pooling_strategies/<model>/<dataset>/:
-
-    pooling_strategies/   one csv per strategy (cosine_distance, avg, ccs, cls)
-    embeddings_<out_file>_n{n}.pkl, embeddings_<out_file>_cls.pkl, log.txt
-
-The ensemble_methods/ folder next to them is created by the ensemble script, not here.
+Same scoring as predict_variant_effects.py, with several poolings around the variant (cosine_distance, avg_n{n}, ccs_n{n}, cls).
+Everything goes to results/pooling_strategies/<model>/<dataset>/<strategy>/.
 '''
 import argparse
 from bend.utils import embedders, Annotation
+from bend.utils.metrics_utils import dataset_name, pooling_dir, embeddings_path, scores_path, score_column
 from tqdm.auto import tqdm
 from scipy import spatial
 import time
@@ -27,33 +16,22 @@ from datetime import datetime
 from contextlib import ExitStack
 
 
-# Special tokens each embedder adds around the sequence when called with remove_special_tokens=False,
-# as (leading, trailing). The other models (ag, borzoi, hyenadna) are called with their defaults,
-# which give one embedding per nucleotide and nothing else.
-# HyenaDNA is causal: its leading [CLS] sees no sequence at all, so it has no use as a summary.
+# Special tokens (leading, trailing) around the sequence of the models that have a [CLS] token.
+# HyenaDNA is left out: it is causal, so its [CLS] sees none of the sequence.
 CLS_MODELS = {
     'nt': (1, 0),        # [CLS] ... (no [SEP])
     'dnabert': (1, 1),   # [CLS] ... [SEP]
-    'genalm': (1, 1),
     'dnabert2': (1, 1),
     'grover': (1, 1),
 }
-
-POOLING_DIR = 'pooling_strategies'
-
-
-def dataset_name(bed_file: str) -> str:
-    '''variant_effects_disease.bed -> disease. Other names are kept as they are (without the extension).'''
-    stem = Path(bed_file).stem
-    return stem[len('variant_effects_'):] if stem.startswith('variant_effects_') else stem
 
 
 def main():
 
     parser = argparse.ArgumentParser('Compute embeddings')
     parser.add_argument('bed_file', type=str, help='Path to the bed file')
-    parser.add_argument('out_file', type=str, help='Run name, used in the names of the output files. Results go to runs/pooling_strategies/<model>/<dataset>/')
-    parser.add_argument('model', choices=['ag', 'nt', 'dnabert', 'genalm', 'hyenadna', 'dnabert2','grover','borzoi'], type=str, help='Model architecture for computing embeddings')
+    parser.add_argument('out_file', type=str, help='Run name, used in the names of the output files. Everything goes to results/pooling_strategies/<model>/<dataset>/')
+    parser.add_argument('model', choices=['ag', 'nt', 'dnabert', 'hyenadna', 'dnabert2','grover','borzoi'], type=str, help='Model architecture for computing embeddings')
     parser.add_argument('checkpoint', type=str, help='Path to or name of the model checkpoint')
     parser.add_argument('genome', type=str, help='Path to the reference genome fasta file')
     parser.add_argument('--extra_context', type=int, default=1024, help='Number of extra nucleotides to include on each side of the sequence')
@@ -70,10 +48,9 @@ def main():
         if Path(value).name != value or value in ('', '.', '..'):
             parser.error(f'{arg_name} must be a plain name, not a path: {value!r}')
 
-    # runs/pooling_strategies/<model>/<dataset>/, anchored at the repository root so that it does not
+    # results/pooling_strategies/<model>/<dataset>/, anchored at the repository root so that it does not
     # depend on the directory the script is run from
-    repo_root = Path(__file__).resolve().parent.parent
-    run_dir = repo_root / 'runs' / 'pooling_strategies' / args.model / dataset
+    out_dir = pooling_dir(args.model, dataset)
 
     extra_context_left = args.extra_context
     extra_context_right = args.extra_context
@@ -87,9 +64,6 @@ def main():
          kwargs['upsample_embeddings'] = True # each nucleotide has an embedding
     elif args.model == 'dnabert':
         embedder = embedders.DNABertEmbedder(args.checkpoint, kmer = args.kmer)
-    elif args.model == 'genalm':
-        embedder = embedders.GENALMEmbedder(args.checkpoint)
-        kwargs['upsample_embeddings'] = True # each nucleotide has an embedding
     elif args.model == 'hyenadna':
         embedder = embedders.HyenaDNAEmbedder(args.checkpoint)
         # autogressive model. No use for right context.
@@ -132,25 +106,22 @@ def main():
     # columns of the bed file, repeated in every strategy csv
     bed_columns = list(genome_annotation.annotation.columns)
 
-    # one entry per pooling strategy: the csv file name and its score columns
-    strategies = {
-        'cosine_distance': ['distance'],
-        'avg': [f'distance_avg_n{n}' for n in args.neighbours],
-        'ccs': [f'distance_ccs_n{n}' for n in args.neighbours],
-    }
+    # one score per csv: cosine_distance, avg_n{n} and ccs_n{n} for every n, and cls
+    scores = ['cosine_distance'] + [f'{s}_n{n}' for s in ('avg', 'ccs') for n in args.neighbours]
     if has_cls:
-        strategies['cls'] = ['distance_cls']
+        scores.append('cls')
     else:
         print(f'{args.model} has no [CLS] token, the cls strategy is skipped')
-    for columns in strategies.values():
-        for column in columns:
-            genome_annotation.annotation[column] = np.nan
+    for score in scores:
+        genome_annotation.annotation[score_column(score)] = np.nan
 
-    run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / POOLING_DIR).mkdir(exist_ok=True)
-    print(f'Results will be written to {run_dir}')
-
-    out_paths = {n: run_dir / f"embeddings_{args.out_file}_n{n}.pkl" for n in args.neighbours}
+    # the mean embeddings go next to the avg_n{n} csv, the [CLS] embeddings next to the cls csv
+    out_paths = {n: embeddings_path(args.model, dataset, args.out_file, f'n{n}') for n in args.neighbours}
+    cls_path = embeddings_path(args.model, dataset, args.out_file, 'cls')
+    csv_paths = {score: scores_path(args.model, dataset, args.out_file, score) for score in scores}
+    for path in list(out_paths.values()) + list(csv_paths.values()) + ([cls_path] if has_cls else []):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    print(f'Results will be written to {out_dir}')
 
     Ncount = 0
     start = time.perf_counter()
@@ -159,7 +130,7 @@ def main():
     with ExitStack() as stack:
         files = {r: stack.enter_context(open(p, "wb")) for r, p in out_paths.items()}
         if has_cls:
-            cls_file = stack.enter_context(open(run_dir / f"embeddings_{args.out_file}_cls.pkl", "wb"))
+            cls_file = stack.enter_context(open(cls_path, "wb"))
 
         for index, row in tqdm(genome_annotation.annotation.iterrows()):
 
@@ -209,21 +180,19 @@ def main():
     print(f"Total elapsed time: {elapsed}")
     print(f"N nucleotides replaced with A: {Ncount}")
 
-    # one csv per strategy, each with the bed columns (start and end hold the window coordinates)
-    for strategy, columns in strategies.items():
-        genome_annotation.annotation[bed_columns + columns].to_csv(run_dir / POOLING_DIR / f"{strategy}_{args.out_file}.csv")
+    # one csv per score, each with the bed columns (start and end hold the window coordinates)
+    for score, path in csv_paths.items():
+        genome_annotation.annotation[bed_columns + [score_column(score)]].to_csv(path)
 
     labels = genome_annotation.annotation['label']
-    scores, auprc_scores = {}, {}
-    for strategy, columns in strategies.items():
-        for column in columns:
-            name = strategy if strategy in ('cosine_distance', 'cls') else column[len('distance_'):]
-            distances = genome_annotation.annotation[column].astype(float)
-            scores[name] = roc_auc_score(labels, distances)
-            auprc_scores[name] = average_precision_score(labels, distances)
-            print(f"AUC {name}: {scores[name]:.4f} | AUPRC {name}: {auprc_scores[name]:.4f}")
+    auc_scores, auprc_scores = {}, {}
+    for score in scores:
+        distances = genome_annotation.annotation[score_column(score)].astype(float)
+        auc_scores[score] = roc_auc_score(labels, distances)
+        auprc_scores[score] = average_precision_score(labels, distances)
+        print(f"AUC {score}: {auc_scores[score]:.4f} | AUPRC {score}: {auprc_scores[score]:.4f}")
 
-    with open(run_dir / "log.txt", "a") as log_f:
+    with open(out_dir / "log.txt", "a") as log_f:
         log_f.write(
             f"{datetime.now():%Y-%m-%d %H:%M:%S} | "
             f"out_file={args.out_file} | "
@@ -231,7 +200,7 @@ def main():
             f"extra_context={args.extra_context} | "
             f"elapsed={elapsed:.2f}s | "
             f"n_variants={len(genome_annotation.annotation)} | "
-            f"AUC={scores} | "
+            f"AUC={auc_scores} | "
             f"AUPRC={auprc_scores}\n"
         )
 

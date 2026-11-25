@@ -1,150 +1,74 @@
+'''
+MLP (or linear classifier) on the embeddings of one model, with stratified k-fold cross-validation.
+'''
 import argparse
-import numpy as np
+
 import pandas as pd
 import torch
-import torch.nn as nn
+from sklearn.metrics import roc_auc_score, average_precision_score
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import roc_auc_score
-import pickle
-from tqdm import tqdm
 
-def load_emb(path):
-    with open(path, "rb") as f:
-        obj = pickle.load(f)
-    if isinstance(obj, pd.DataFrame):
-        return obj.select_dtypes("number").values
-    if isinstance(obj, dict):  # e.g. {"embeddings": ..., "labels": ...} or {id: vec}
-        # adjust the key if needed
-        obj = obj["embeddings"] if "embeddings" in obj else np.stack(list(obj.values()))
-    if torch.is_tensor(obj):
-        obj = obj.cpu().numpy()
-    return np.asarray(obj)
-
-def load_pairs(path):
-    idx, ref, alt = [], [], []
-    with open(path, "rb") as f:
-        while True:
-            try:
-                i, r, a = pickle.load(f)
-            except EOFError:
-                break
-            idx.append(i); ref.append(r); alt.append(a)
-    return np.array(idx), np.stack(ref), np.stack(alt)
+from bend.utils.metrics_utils import (add_single_model_args, add_mlp_args, single_model_paths, load_pairs,
+                                      load_annotation, build_features, seed_everything, get_device, to_tensor,
+                                      train_mlp, predict_logits, bce, mean_std, print_summary, results_dir,
+                                      save_results, mlp_settings, summary_fields)
 
 
+def cross_validate(X, y, args, device):
+    '''AUROC, AUPRC and validation loss of each fold.'''
+    skf = StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=args.seed)
+    rows = []
+    for fold, (tr, te) in enumerate(skf.split(X, y), 1):
+        # scale on train only (no leakage)
+        scaler = StandardScaler().fit(X[tr])
+        X_tr, X_te = to_tensor(scaler.transform(X[tr]), device), to_tensor(scaler.transform(X[te]), device)
+        y_tr, y_te = to_tensor(y[tr], device), to_tensor(y[te], device)
 
-def make_model(d_in, n_out):
-    out = 1 if n_out == 2 else n_out
-    if args.hidden == 0 or args.layers == 0:
-        return nn.Linear(d_in, out)
-    layers, d = [], d_in
-    for _ in range(args.layers):
-        layers += [nn.Linear(d, args.hidden), nn.ReLU(), nn.Dropout(args.dropout)]
-        d = args.hidden
-    layers.append(nn.Linear(d, out))
-    return nn.Sequential(*layers)
- 
- 
-def predict_proba(model, X_t):
-    model.eval()
-    with torch.no_grad():
-        logits = model(X_t)
-        if n_classes == 2:
-            return torch.sigmoid(logits).squeeze(1).cpu().numpy()
-        return torch.softmax(logits, dim=1).cpu().numpy()
- 
- 
-def auc(y_true, probs):
-    if n_classes == 2:
-        return roc_auc_score(y_true, probs)
-    return roc_auc_score(y_true, probs, multi_class="ovr", average="macro")
- 
+        model = train_mlp(X_tr, y_tr, args, desc=f'Fold {fold}')
+        logits = predict_logits(model, X_te)
+        probs = torch.sigmoid(logits).cpu().numpy()
+
+        rows.append({'fold': fold, 'AUC': roc_auc_score(y[te], probs),
+                     'AUPRC': average_precision_score(y[te], probs), 'val_loss': bce(logits, y_te)})
+        print(f"Fold {fold}: AUC = {rows[-1]['AUC']:.4f} | AUPRC = {rows[-1]['AUPRC']:.4f} | val loss = {rows[-1]['val_loss']:.4f}\n")
+    return rows
 
 
-p = argparse.ArgumentParser()
-p.add_argument("--folds", type=int, default=5)
-p.add_argument("--epochs", type=int, default=10)
-p.add_argument("--lr", type=float, default=1e-4)
-p.add_argument("--batch_size", type=int, default=256)
-p.add_argument("--hidden", type=int, default=256, help="0 = linear classifier")
-p.add_argument("--layers", type=int, default=1)
-p.add_argument("--dropout", type=int, default=0.1)
-p.add_argument("--seed", type=int, default=42)
-p.add_argument("--random", action="store_true", help="skip training: randomly initialised model")
-args = p.parse_args()
- 
-torch.manual_seed(args.seed)
-np.random.seed(args.seed)
-device = "cuda" if torch.cuda.is_available() else "cpu"
- 
-# ---- load data --
-_, ref, alt = load_pairs("../../runs/dnabert2/tgc2048_dnabert2/embeddings_tgc2048_dnabert2.pkl")
-#ref = load_emb("../../embeddings/ref_embeddings_disease_hyena_large_512.pkl")
-#alt = load_emb("../../embeddings/alt_embeddings_disease_hyena_large_512.pkl")
-label_df = pd.read_csv("../../runs/dnabert2/tgc2048_dnabert2/cosine_distance_tgc2048_dnabert2.csv")
-LABEL_COL = "label"  # adjust to the label column name in the .csv
+def main():
 
-assert ref.shape == alt.shape and len(ref) == len(label_df), (
-    f"ref={ref.shape} alt={alt.shape} labels={len(label_df)}"
-)
+    parser = argparse.ArgumentParser('Cross-validated MLP on the variant embeddings of one model')
+    add_single_model_args(parser, default_features=['diff'])
+    add_mlp_args(parser)
+    args = parser.parse_args()
 
-X= (ref-alt).astype(np.float32)
-#X = ((alt + ref)/2).astype(np.float32)
-#X = (alt*ref).astype(np.float32)
-#X = np.concatenate([ref, alt], axis=1).astype(np.float32)
-y_raw = label_df[LABEL_COL].values
+    emb_path, labels_path = single_model_paths(parser, args)
+    device = get_device()
 
-classes, y = np.unique(y_raw, return_inverse=True)
-n_classes = len(classes)
-print(f"X: {X.shape} | classes: {n_classes} {dict(zip(classes, np.bincount(y)))} | device: {device}")
- 
- 
- 
-skf = StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=args.seed)
-aucs = []
- 
-for fold, (tr, te) in enumerate(skf.split(X, y), 1):
-    # scale on train only (no leakage)
-    scaler = StandardScaler().fit(X[tr])
-    X_tr = torch.tensor(scaler.transform(X[tr]), dtype=torch.float32, device=device)
-    X_te = torch.tensor(scaler.transform(X[te]), dtype=torch.float32, device=device)
+    idx, ref, alt = load_pairs(emb_path)
+    y = load_annotation(labels_path, idx)['label'].to_numpy()
+    print(f'Embeddings: {emb_path}')
+    print(f'Labels:     {labels_path}')
+    print(f'{len(y)} variants ({y.sum()} positive) | embedding size {ref.shape[1]} | device: {device}')
 
-    y_dtype = torch.float32 if n_classes == 2 else torch.long
-    y_tr = torch.tensor(y[tr], dtype=y_dtype, device=device)
-    y_te = torch.tensor(y[te], dtype=y_dtype, device=device)
-    loss_fn = nn.BCEWithLogitsLoss() if n_classes == 2 else nn.CrossEntropyLoss()
+    summary, all_rows, log_fields = {}, [], []
+    for feature in args.features:
+        seed_everything(args.seed)
+        X = build_features(ref, alt, feature)
+        print(f'\n=== features: {feature} | X: {X.shape}')
+        rows = cross_validate(X, y, args, device)
 
-    model = make_model(X.shape[1], n_classes).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+        summary[feature] = {'AUC': mean_std([r['AUC'] for r in rows]), 'AUPRC': mean_std([r['AUPRC'] for r in rows])}
+        print(f"Mean AUC: {summary[feature]['AUC']} | Mean AUPRC: {summary[feature]['AUPRC']}")
+        all_rows += [{'features': feature, **r} for r in rows]
+        log_fields.append({'out_file': args.out_file, 'pooling': args.pooling, 'features': feature,
+                           'embeddings': emb_path, **summary_fields(rows, y), **mlp_settings(args), 'device': device})
 
-    if not args.random:
-        n = len(X_tr)
-        for epoch in range(1, args.epochs + 1):
-            model.train()
-            perm = torch.randperm(n, device=device)
-            running, steps = torch.zeros((), device=device), 0
-            for i in range(0, n, args.batch_size):
-                idx = perm[i : i + args.batch_size]
-                out = model(X_tr[idx])
-                out = out.squeeze(1) if n_classes == 2 else out
-                loss = loss_fn(out, y_tr[idx])
-                opt.zero_grad()
-                loss.backward()
-                opt.step()
-                running += loss.detach()
-                steps += 1
-            print(f"Fold {fold} | epoch {epoch:3d} | train loss = {running.item() / steps:.4f}")
+    print_summary(f'MLP | {args.model} | {args.dataset} | {args.out_file} | {args.pooling}'
+                  f' (AUPRC of a random classifier: {y.mean():.4f})', summary)
+    save_results(results_dir(__file__, args.model, args.dataset), f'{args.out_file}_{args.pooling}',
+                 pd.DataFrame(all_rows), log_fields)
 
-    # validation loss on the held-out fold
-    model.eval()
-    with torch.no_grad():
-        val_out = model(X_te)
-        val_out = val_out.squeeze(1) if n_classes == 2 else val_out
-        val_loss = loss_fn(val_out, y_te).item()
 
-    fold_auc = auc(y[te], predict_proba(model, X_te))
-    aucs.append(fold_auc)
-    print(f"Fold {fold}: AUC = {fold_auc:.4f} | val loss = {val_loss:.4f}\n")
- 
-print(f"\nMean AUC: {np.mean(aucs):.4f} ± {np.std(aucs):.4f}")
+if __name__ == '__main__':
+    main()

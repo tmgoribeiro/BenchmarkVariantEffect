@@ -11,4 +11,3 @@ peft==0.10.0
 alphagenome-pytorch
 huggingface_hub
 pyarrow
-omegaconf

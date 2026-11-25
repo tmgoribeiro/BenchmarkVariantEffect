@@ -1,12 +1,16 @@
+'''
+K-fold version of fine-tune_variant_effects.py: reports the mean and std of the best validation loss.
+'''
 import argparse
-import os
-from bend.utils import embedders, Annotation
-from tqdm.auto import tqdm
-import torch
+
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
+import torch
 import torch.nn.functional as F
-from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.model_selection import StratifiedKFold
+from torch.utils.data import DataLoader, Dataset
+from tqdm.auto import tqdm
+
+from bend.utils import Annotation, embedders
 
 
 class VariantPairDataset(Dataset):
@@ -27,10 +31,6 @@ class VariantPairDataset(Dataset):
         }
 
 
-def extract_embedding(embed_output, idx):
-    return torch.stack([torch.as_tensor(e[idx]) for e in embed_output])
-
-
 def contrastive_loss(emb_wt, emb_alt, labels, margin=10.0):
     labels = labels.float()
     cos_sim = F.cosine_similarity(emb_wt, emb_alt, dim=-1)
@@ -40,15 +40,6 @@ def contrastive_loss(emb_wt, emb_alt, labels, margin=10.0):
     benign_term = (1.0 - labels) * distance ** 2
 
     return (pathogenic_term + benign_term).mean()
-
-
-def build_loader(wt_sequences, alt_sequences, labels, batch_size, shuffle):
-    dataset = VariantPairDataset(
-        wt_sequences,
-        alt_sequences,
-        labels,
-    )
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 
 
 def run_epoch(embedder, loader, device, embedding_idx, optimizer=None):
@@ -62,12 +53,8 @@ def run_epoch(embedder, loader, device, embedding_idx, optimizer=None):
         for batch in loader:
             labels_batch = batch["label"].to(device)
 
-            emb_wt = embedder.training_embed(
-                batch["wt"], embedding_idx, use_grads=train_mode
-            ).to(device)
-            emb_alt = embedder.training_embed(
-                batch["alt"], embedding_idx, use_grads=train_mode
-            ).to(device)
+            emb_wt = embedder.training_embed(batch["wt"], embedding_idx, use_grads=train_mode).to(device)
+            emb_alt = embedder.training_embed(batch["alt"], embedding_idx, use_grads=train_mode).to(device)
 
             loss = contrastive_loss(emb_wt, emb_alt, labels_batch)
 
@@ -81,97 +68,47 @@ def run_epoch(embedder, loader, device, embedding_idx, optimizer=None):
     return total_loss / len(loader)
 
 
-def train_model(embedder, train_loader, val_loader, device, args, save_path=None):
-    """Trains for args.epochs, tracking + optionally saving the best val checkpoint.
-    Returns the best val loss achieved."""
-    optimizer = torch.optim.AdamW(
-        [p for p in embedder.model.parameters() if p.requires_grad], lr=1e-5
-    )
+def train_model(embedder, train_loader, val_loader, device, args):
+    """Trains for args.epochs and returns the best validation loss."""
+    optimizer = torch.optim.AdamW([p for p in embedder.model.parameters() if p.requires_grad], lr=1e-5)
 
     best_val_loss = float("inf")
     for epoch in range(args.epochs):
         train_loss = run_epoch(embedder, train_loader, device, args.embedding_idx, optimizer)
         val_loss = run_epoch(embedder, val_loader, device, args.embedding_idx)
-
         print(f"  Epoch {epoch + 1}/{args.epochs}: train loss = {train_loss:.4f}, val loss = {val_loss:.4f}")
-
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            if save_path is not None:
-                embedder.model.save_pretrained(save_path)
+        best_val_loss = min(best_val_loss, val_loss)
 
     return best_val_loss
 
 
-def get_embedder(args):
-    kwargs = {'disable_tqdm': True}
-    extra_context_left = args.extra_context
-    extra_context_right = args.extra_context
-
-    if args.model == 'ag':
-        embedder = embedders.AlphaGenomeEmbedder(args.checkpoint)
-    elif args.model == 'nt':
-        embedder = embedders.NucleotideTransformerEmbedder(args.checkpoint)
-        kwargs['upsample_embeddings'] = True
-    elif args.model == 'dnabert':
-        embedder = embedders.DNABertEmbedder(args.checkpoint, kmer=args.kmer)
-    elif args.model == 'gpn':
-        embedder = embedders.GPNEmbedder(args.checkpoint)
-    elif args.model == 'genalm':
-        embedder = embedders.GENALMEmbedder(args.checkpoint)
-        kwargs['upsample_embeddings'] = True
-    elif args.model == 'hyenadna':
-        embedder = embedders.HyenaDNAEmbedder(args.checkpoint)
-        extra_context_right = 0
-    elif args.model == 'dnabert2':
-        embedder = embedders.DNABert2Embedder(args.checkpoint)
-        kwargs['upsample_embeddings'] = True
-    elif args.model == 'grover':
-        embedder = embedders.GROVEREmbedder(args.checkpoint)
-        kwargs['upsample_embeddings'] = True
-    else:
-        raise ValueError('Model not supported')
-
-    return embedder, extra_context_left, extra_context_right
-
-
 def main():
-    parser = argparse.ArgumentParser('Compute embeddings')
+    parser = argparse.ArgumentParser('Cross-validated fine-tuning of DNABERT-2 on variant pairs')
     parser.add_argument('bed_file', type=str, help='Path to the bed file')
-    parser.add_argument('model', choices=['ag', 'nt', 'dnabert', 'gpn', 'genalm', 'hyenadna', 'dnabert2', 'grover'], type=str, help='Model architecture for computing embeddings')
+    parser.add_argument('model', choices=['dnabert2'], type=str, help='Model to fine-tune (only DNABERT-2 supports it)')
     parser.add_argument('checkpoint', type=str, help='Path to or name of the model checkpoint')
     parser.add_argument('genome', type=str, help='Path to the reference genome fasta file')
     parser.add_argument('batch_size', type=int, help='Fine-tuning batch size')
     parser.add_argument('epochs', type=int, help='Fine-tuning epochs per fold')
     parser.add_argument('--extra_context', type=int, default=256, help='Number of extra nucleotides to include on each side of the sequence')
-    parser.add_argument('--kmer', type=int, default=3, help='Kmer size for the DNABERT model')
     parser.add_argument('--embedding_idx', type=int, default=None, help='Index of the embedding to use for computing the distance. Defaults to the position of the variant in the window')
     parser.add_argument('--max_variants', type=int, default=None, help='Only use the first N variants (for quick tests). Defaults to all')
     parser.add_argument('--n_folds', type=int, default=5, help='Number of cross-validation folds')
-    parser.add_argument('--out_dir', type=str, default=None, help='Where fold/final checkpoints are saved')
 
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    #os.makedirs(args.out_dir, exist_ok=True)
-
-    # only needed for the context sizes; a fresh embedder is loaded for every fold below
-    embedder, extra_context_left, extra_context_right = get_embedder(args)
-    del embedder
 
     genome_annotation = Annotation(args.bed_file, reference_genome=args.genome)
     if args.max_variants is not None:
         genome_annotation.annotation = genome_annotation.annotation.iloc[:args.max_variants].reset_index(drop=True)
 
-    # The variant is at the 0-based position `start`. Normalise the segments so that it ends up at
-    # index extra_context_left of the window (see predict_variant_effects.py).
-    causal = extra_context_right == 0
-    genome_annotation.annotation['end'] = genome_annotation.annotation['start'] + int(causal)
-
+    # put the variant (0-based `start`) at index extra_context of every window
+    genome_annotation.annotation['end'] = genome_annotation.annotation['start']
     if args.extra_context > 0:
-        genome_annotation.extend_segments(extra_context_left=extra_context_left, extra_context_right=extra_context_right)
+        genome_annotation.extend_segments(extra_context_left=args.extra_context, extra_context_right=args.extra_context)
 
-    variant_idx = extra_context_left if args.extra_context > 0 else 0
+    variant_idx = args.extra_context if args.extra_context > 0 else 0
     if args.embedding_idx is None:
         args.embedding_idx = variant_idx
     genome_annotation.check_reference(variant_idx)
@@ -187,30 +124,25 @@ def main():
         alt_sequences.append(dna_alt)
         labels.append(row['label'])
 
-    # stratified k-fold cross-validation
-    skf = StratifiedKFold(n_splits=args.n_folds, shuffle=True, random_state=42)
+    def loader(idx, shuffle):
+        dataset = VariantPairDataset([wt_sequences[i] for i in idx], [alt_sequences[i] for i in idx], [labels[i] for i in idx])
+        return DataLoader(dataset, batch_size=args.batch_size, shuffle=shuffle)
 
+    skf = StratifiedKFold(n_splits=args.n_folds, shuffle=True, random_state=42)
     fold_val_losses = []
-    for fold, (tr_rel, val_rel) in enumerate(skf.split(np.zeros(len(labels)), labels)):
+    for fold, (tr, val) in enumerate(skf.split(np.zeros(len(labels)), labels)):
         print(f"\n=== Fold {fold + 1}/{args.n_folds} ===")
 
-        train_loader = build_loader([wt_sequences[i] for i in tr_rel], [alt_sequences[i] for i in tr_rel],
-                                    [labels[i] for i in tr_rel], args.batch_size, shuffle=True)
-        val_loader = build_loader([wt_sequences[i] for i in val_rel], [alt_sequences[i] for i in val_rel],
-                                  [labels[i] for i in val_rel], args.batch_size, shuffle=False)
-
-        # Reset the embedder's trainable weights for each fold.
-        embedder, _, _ = get_embedder(args)
+        # a fresh model for every fold
+        embedder = embedders.DNABert2Embedder(args.checkpoint)
         embedder.prepare_for_finetuning()
 
-        #fold_ckpt = os.path.join(args.out_dir, f"fold_{fold + 1}")
-        best_val_loss = train_model(embedder, train_loader, val_loader, device, args, save_path=None)
+        best_val_loss = train_model(embedder, loader(tr, shuffle=True), loader(val, shuffle=False), device, args)
         fold_val_losses.append(best_val_loss)
         print(f"Fold {fold + 1} best val loss: {best_val_loss:.4f}")
 
     fold_val_losses = np.array(fold_val_losses)
     print(f"\nCV val loss: {fold_val_losses.mean():.4f} +/- {fold_val_losses.std():.4f}")
-
 
 
 if __name__ == '__main__':

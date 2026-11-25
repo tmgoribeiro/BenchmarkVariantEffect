@@ -1,98 +1,70 @@
+'''
+Random forest on the embeddings of one model, with stratified k-fold cross-validation.
+'''
 import argparse
-import numpy as np
+
 import pandas as pd
-from sklearn.model_selection import StratifiedKFold
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import roc_auc_score
-import pickle
-#from cuml.ensemble import RandomForestClassifier
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import log_loss
+from sklearn.metrics import roc_auc_score, average_precision_score, log_loss
+from sklearn.model_selection import StratifiedKFold
 
-def load_emb(path):
-    with open(path, "rb") as f:
-        obj = pickle.load(f)
-    if isinstance(obj, pd.DataFrame):
-        return obj.select_dtypes("number").values
-    if isinstance(obj, dict):  # e.g. {"embeddings": ..., "labels": ...} or {id: vec}
-        # adjust the key if needed
-        obj = obj["embeddings"] if "embeddings" in obj else np.stack(list(obj.values()))
-    return np.asarray(obj)
-
-def load_pairs(path):
-    idx, ref, alt = [], [], []
-    with open(path, "rb") as f:
-        while True:
-            try:
-                i, r, a = pickle.load(f)
-            except EOFError:
-                break
-            idx.append(i); ref.append(r); alt.append(a)
-    return np.array(idx), np.stack(ref), np.stack(alt)
- 
- 
-def auc(y_true, probs):
-    if n_classes == 2:
-        return roc_auc_score(y_true, probs)
-    return roc_auc_score(y_true, probs, multi_class="ovr", average="macro")
- 
+from bend.utils.metrics_utils import (add_single_model_args, single_model_paths, load_pairs, load_annotation,
+                                      build_features, mean_std, print_summary, results_dir, save_results,
+                                      summary_fields)
 
 
-p = argparse.ArgumentParser()
-p.add_argument("--folds", type=int, default=5)
-p.add_argument("--n_estimators", type=int, default=500)
-p.add_argument("--max_depth", type=int, default=8)
-p.add_argument("--seed", type=int, default=42)
-args = p.parse_args()
- 
-# ---- load data --
-#_, ref, alt = load_pairs("../../runs/dnabert2/tgm2048_dnabert2/embeddings_tgm2048_dnabert2.pkl")
-_, ref, alt = load_pairs("../../runs/dnabert2/tgc2048_dnabert2/embeddings_tgc2048_dnabert2.pkl")
+def cross_validate(X, y, args):
+    '''AUROC, AUPRC and validation loss of each fold.'''
+    skf = StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=args.seed)
+    rows = []
+    for fold, (tr, te) in enumerate(skf.split(X, y), 1):
+        clf = RandomForestClassifier(n_estimators=args.n_estimators, max_depth=args.max_depth,
+                                     random_state=args.seed, n_jobs=-1)
+        clf.fit(X[tr], y[tr])
+        probs = clf.predict_proba(X[te])[:, 1]
 
-#ref = load_emb("../../embeddings/ref_embeddings_disease_hyena_large_512.pkl")
-#alt = load_emb("../../embeddings/alt_embeddings_disease_hyena_large_512.pkl")
-label_df = pd.read_csv("../../runs/dnabert2/tgc2048_dnabert2/cosine_distance_tgc2048_dnabert2.csv")
-LABEL_COL = "label"  # adjust to the label column name in the .csv
+        rows.append({'fold': fold, 'AUC': roc_auc_score(y[te], probs),
+                     'AUPRC': average_precision_score(y[te], probs), 'val_loss': log_loss(y[te], probs, labels=[0, 1])})
+        print(f"Fold {fold}: AUC = {rows[-1]['AUC']:.4f} | AUPRC = {rows[-1]['AUPRC']:.4f} | val loss = {rows[-1]['val_loss']:.4f}")
+    return rows
 
-assert ref.shape == alt.shape and len(ref) == len(label_df), (
-    f"ref={ref.shape} alt={alt.shape} labels={len(label_df)}"
-)
-print(f"ref={ref.shape} alt={alt.shape} labels={len(label_df)}")
 
-#X = (ref*alt).astype(np.float32)  # element-wise multiplication of ref and alt embeddings
-X= (ref-alt).astype(np.float32)
-#X = ((alt + ref)/2).astype(np.float32)
-#X = np.concatenate([ref, alt], axis=1).astype(np.float32)
-y_raw = label_df[LABEL_COL].values
+def main():
 
-classes, y = np.unique(y_raw, return_inverse=True)
-n_classes = len(classes)
-print(f"X: {X.shape} | classes: {n_classes} {dict(zip(classes, np.bincount(y)))}")
- 
- 
- 
-skf = StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=args.seed)
-aucs = []
- 
-for fold, (tr, te) in enumerate(skf.split(X, y), 1):
-    clf = RandomForestClassifier(
-        n_estimators=args.n_estimators,
-        max_depth=args.max_depth,
-        random_state=args.seed,
-        n_jobs=-1,
-    )
-    clf.fit(X[tr], y[tr])
+    parser = argparse.ArgumentParser('Cross-validated random forest on the variant embeddings of one model')
+    add_single_model_args(parser, default_features=['diff'])
+    parser.add_argument('--folds', type=int, default=5)
+    parser.add_argument('--n_estimators', type=int, default=500)
+    parser.add_argument('--max_depth', type=int, default=8)
+    parser.add_argument('--seed', type=int, default=42)
+    args = parser.parse_args()
 
-    probs = clf.predict_proba(X[te])
-    probs = probs.get() if hasattr(probs, "get") else np.asarray(probs)  # cupy -> numpy if needed
-    if n_classes == 2:
-        probs_auc = probs[:, 1]
-    else:
-        probs_auc = probs
+    emb_path, labels_path = single_model_paths(parser, args)
 
-    fold_auc = auc(y[te], probs_auc)
-    val_loss = log_loss(y[te], probs, labels=np.arange(n_classes))
-    aucs.append(fold_auc)
-    print(f"Fold {fold}: AUC = {fold_auc:.4f} | val loss = {val_loss:.4f}")
- 
-print(f"\nMean AUC: {np.mean(aucs):.4f} ± {np.std(aucs):.4f}")
+    idx, ref, alt = load_pairs(emb_path)
+    y = load_annotation(labels_path, idx)['label'].to_numpy()
+    print(f'Embeddings: {emb_path}')
+    print(f'Labels:     {labels_path}')
+    print(f'{len(y)} variants ({y.sum()} positive) | embedding size {ref.shape[1]}')
+
+    summary, all_rows, log_fields = {}, [], []
+    for feature in args.features:
+        X = build_features(ref, alt, feature)
+        print(f'\n=== features: {feature} | X: {X.shape}')
+        rows = cross_validate(X, y, args)
+
+        summary[feature] = {'AUC': mean_std([r['AUC'] for r in rows]), 'AUPRC': mean_std([r['AUPRC'] for r in rows])}
+        print(f"Mean AUC: {summary[feature]['AUC']} | Mean AUPRC: {summary[feature]['AUPRC']}")
+        all_rows += [{'features': feature, **r} for r in rows]
+        log_fields.append({'out_file': args.out_file, 'pooling': args.pooling, 'features': feature,
+                           'embeddings': emb_path, **summary_fields(rows, y), 'folds': args.folds,
+                           'n_estimators': args.n_estimators, 'max_depth': args.max_depth, 'seed': args.seed})
+
+    print_summary(f'Random forest | {args.model} | {args.dataset} | {args.out_file} | {args.pooling}'
+                  f' (AUPRC of a random classifier: {y.mean():.4f})', summary)
+    save_results(results_dir(__file__, args.model, args.dataset), f'{args.out_file}_{args.pooling}',
+                 pd.DataFrame(all_rows), log_fields)
+
+
+if __name__ == '__main__':
+    main()

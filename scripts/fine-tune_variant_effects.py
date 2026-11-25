@@ -1,16 +1,17 @@
-
+'''
+LoRA fine-tuning of DNABERT-2 with a contrastive loss on ref/alt pairs, then the test AUROC and AUPRC of the cosine distance.
+'''
 import argparse
-from bend.utils import embedders, Annotation
-from tqdm.auto import tqdm
-from scipy import spatial
-import time
+
 import torch
-import torchvision.models as models
-import numpy as np
-from torch.utils.data import Dataset, DataLoader
 import torch.nn.functional as F
+from scipy import spatial
+from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import roc_auc_score, average_precision_score
+from torch.utils.data import DataLoader, Dataset
+from tqdm.auto import tqdm
+
+from bend.utils import Annotation, embedders
 
 
 class VariantPairDataset(Dataset):
@@ -30,92 +31,53 @@ class VariantPairDataset(Dataset):
             "label": self.labels[idx],
         }
 
-def extract_embedding(embed_output, idx):
-    return torch.stack([torch.as_tensor(e[idx]) for e in embed_output])
 
 def contrastive_loss(emb_wt, emb_alt, labels, margin=10.0):
-
     labels = labels.float()
     cos_sim = F.cosine_similarity(emb_wt, emb_alt, dim=-1)
     distance = 1.0 - cos_sim  # cosine distance, range [0, 2]
- 
+
     pathogenic_term = labels * torch.clamp(margin - distance, min=0.0) ** 2
     benign_term = (1.0 - labels) * distance ** 2
- 
+
     return (pathogenic_term + benign_term).mean()
+
 
 def main():
 
-    parser = argparse.ArgumentParser('Compute embeddings')
+    parser = argparse.ArgumentParser('Fine-tune DNABERT-2 on variant pairs')
     parser.add_argument('bed_file', type=str, help='Path to the bed file')
-    # model can be any of the ones supported by bend.utils.embedders
-    parser.add_argument('model', choices=['ag', 'nt', 'dnabert', 'gpn', 'genalm', 'hyenadna', 'dnabert2','grover'], type=str, help='Model architecture for computing embeddings')
+    parser.add_argument('model', choices=['dnabert2'], type=str, help='Model to fine-tune (only DNABERT-2 supports it)')
     parser.add_argument('checkpoint', type=str, help='Path to or name of the model checkpoint')
     parser.add_argument('genome', type=str, help='Path to the reference genome fasta file')
     parser.add_argument('batch_size', type=int, help='Fine-tuning batch size')
     parser.add_argument('epochs', type=int, help='Fine-tuning epochs')
     parser.add_argument('--extra_context', type=int, default=256, help='Number of extra nucleotides to include on each side of the sequence')
-    parser.add_argument('--kmer', type=int, default=3, help = 'Kmer size for the DNABERT model')
     parser.add_argument('--embedding_idx', type=int, default=None, help = 'Index of the embedding to use for computing the distance. Defaults to the position of the variant in the window')
     parser.add_argument('--max_variants', type=int, default=None, help = 'Only use the first N variants (for quick tests). Defaults to all')
 
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    extra_context_left = args.extra_context
-    extra_context_right = args.extra_context
-
-    kwargs = {'disable_tqdm': True}
-    # get the embedder
-    if args.model == 'ag':
-         embedder = embedders.AlphaGenomeEmbedder(args.checkpoint)
-    elif args.model == 'nt':
-         embedder = embedders.NucleotideTransformerEmbedder(args.checkpoint)
-         kwargs['upsample_embeddings'] = True # each nucleotide has an embedding
-    elif args.model == 'dnabert':
-        embedder = embedders.DNABertEmbedder(args.checkpoint, kmer = args.kmer)
-    elif args.model == 'gpn':
-        embedder = embedders.GPNEmbedder(args.checkpoint)
-    elif args.model == 'genalm':
-        embedder = embedders.GENALMEmbedder(args.checkpoint)
-        kwargs['upsample_embeddings'] = True # each nucleotide has an embedding
-    elif args.model == 'hyenadna':
-        embedder = embedders.HyenaDNAEmbedder(args.checkpoint)
-        # autogressive model. No use for right context.
-        extra_context_left = args.extra_context
-        extra_context_right = 0
-    elif args.model == 'dnabert2':
-        embedder = embedders.DNABert2Embedder(args.checkpoint)
-        kwargs['upsample_embeddings'] = True # each nucleotide has an embedding
-    elif args.model == 'grover':
-        embedder = embedders.GROVEREmbedder(args.checkpoint)
-        kwargs['upsample_embeddings'] = True # each nucleotide has an embedding
-    else:
-        raise ValueError('Model not supported')
-    
+    embedder = embedders.DNABert2Embedder(args.checkpoint)
+    kwargs = {'disable_tqdm': True, 'upsample_embeddings': True}  # one embedding per nucleotide
 
     # load the bed file
     genome_annotation = Annotation(args.bed_file, reference_genome=args.genome)
     if args.max_variants is not None:
         genome_annotation.annotation = genome_annotation.annotation.iloc[:args.max_variants].reset_index(drop=True)
 
-    # The variant is at the 0-based position `start`. Normalise the segments so that it ends up at
-    # index extra_context_left of the window (see predict_variant_effects.py).
-    causal = extra_context_right == 0
-    genome_annotation.annotation['end'] = genome_annotation.annotation['start'] + int(causal)
-
-    # extend the segments if necessary
+    # put the variant (0-based `start`) at index extra_context of every window
+    genome_annotation.annotation['end'] = genome_annotation.annotation['start']
     if args.extra_context > 0:
-        genome_annotation.extend_segments(extra_context_left=extra_context_left, extra_context_right=extra_context_right)
+        genome_annotation.extend_segments(extra_context_left=args.extra_context, extra_context_right=args.extra_context)
 
-    variant_idx = extra_context_left if args.extra_context > 0 else 0
+    variant_idx = args.extra_context if args.extra_context > 0 else 0
     if args.embedding_idx is None:
         args.embedding_idx = variant_idx
     genome_annotation.check_reference(variant_idx)
 
     wt_sequences, alt_sequences, labels = [], [], []
-
     for index, row in tqdm(genome_annotation.annotation.iterrows(), desc="Building sequence pairs"):
         dna = genome_annotation.get_dna_segment(index=index).upper().replace('N', 'A')
         dna_alt = list(dna)
@@ -126,43 +88,20 @@ def main():
         alt_sequences.append(dna_alt)
         labels.append(row['label'])
 
-    trainval_idx, test_idx = train_test_split(
-            range(len(labels)),
-            test_size=0.2,          # or expose as --val_split arg
-            random_state=42,
-            stratify=labels,        # keeps pathogenic/benign ratio balanced
-    )
+    # 64 / 16 / 20 train / validation / test split, stratified by label
+    trainval_idx, test_idx = train_test_split(range(len(labels)), test_size=0.2, random_state=42, stratify=labels)
+    train_idx, val_idx = train_test_split(trainval_idx, test_size=0.2, random_state=42,
+                                          stratify=[labels[i] for i in trainval_idx])
 
-    trainval_labels = [labels[i] for i in trainval_idx]
+    def loader(idx, shuffle):
+        dataset = VariantPairDataset([wt_sequences[i] for i in idx], [alt_sequences[i] for i in idx], [labels[i] for i in idx])
+        return DataLoader(dataset, batch_size=args.batch_size, shuffle=shuffle)
 
-    train_idx, val_idx = train_test_split(
-        trainval_idx,
-        test_size=0.2,          # or expose as --val_split arg
-        random_state=42,
-        stratify=trainval_labels,        # keeps pathogenic/benign ratio balanced
-    )
-
-    train_dataset = VariantPairDataset(
-        [wt_sequences[i] for i in train_idx],
-        [alt_sequences[i] for i in train_idx],
-        [labels[i] for i in train_idx],
-    )
-    val_dataset = VariantPairDataset(
-        [wt_sequences[i] for i in val_idx],
-        [alt_sequences[i] for i in val_idx],
-        [labels[i] for i in val_idx],
-    )
-
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
+    train_loader = loader(train_idx, shuffle=True)
+    val_loader = loader(val_idx, shuffle=False)
 
     embedder.prepare_for_finetuning()
-
-    optimizer = torch.optim.AdamW(
-        [p for p in embedder.model.parameters() if p.requires_grad], lr=1e-5
-    )
-
-    best_val_loss = 10
+    optimizer = torch.optim.AdamW([p for p in embedder.model.parameters() if p.requires_grad], lr=1e-5)
 
     for epoch in range(args.epochs):
         embedder.model.train()
@@ -189,43 +128,20 @@ def main():
                 emb_wt = embedder.training_embed(batch["wt"], args.embedding_idx, use_grads=False).to(device)
                 emb_alt = embedder.training_embed(batch["alt"], args.embedding_idx, use_grads=False).to(device)
 
-                loss = contrastive_loss(emb_wt, emb_alt, labels_batch)
-                val_loss += loss.item()
+                val_loss += contrastive_loss(emb_wt, emb_alt, labels_batch).item()
 
         val_loss /= len(val_loader)
-        #print(f"Epoch {epoch+1}: val loss = {val_loss:.4f}")
         print(f"Epoch {epoch+1}: train loss = {epoch_loss / len(train_loader):.4f}, val loss = {val_loss:.4f}")
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            #embedder.model.save_pretrained("pretrained_models/DNABert2_lora")
-
-
-    #Test
-
-    test_wt_seqs = [wt_sequences[i] for i in test_idx]
-    test_alt_seqs = [alt_sequences[i] for i in test_idx]
+    # test: zero-shot score (cosine distance) of the fine-tuned model
     test_labels = [labels[i] for i in test_idx]
-    test_seqs = zip(test_wt_seqs, test_alt_seqs, test_labels)
-
     test_distance = []
+    for i in tqdm(test_idx, desc="Testing"):
+        embedding_wt, embedding_alt = embedder.embed([wt_sequences[i], alt_sequences[i]], **kwargs)
+        test_distance.append(spatial.distance.cosine(embedding_alt[0, args.embedding_idx], embedding_wt[0, args.embedding_idx]))
 
-    for wt, alt, label in tqdm(test_seqs, total=len(test_labels), desc="Testing"):
-
-        embedding_wt, embedding_alt = embedder.embed([wt, alt], **kwargs)
-        embedding_wt = embedding_wt[0, args.embedding_idx]
-        embedding_alt = embedding_alt[0, args.embedding_idx]
-
-        d = spatial.distance.cosine(embedding_alt, embedding_wt)
-        test_distance.append(d)
-
-    final_score = roc_auc_score(test_labels, test_distance)
-    final_auprc = average_precision_score(test_labels, test_distance)
-    print(f"Final Score: {final_score}")
-    print(f"AUPRC: {final_auprc}")
-
-
-
+    print(f"Final Score: {roc_auc_score(test_labels, test_distance)}")
+    print(f"AUPRC: {average_precision_score(test_labels, test_distance)}")
 
 
 if __name__ == '__main__':

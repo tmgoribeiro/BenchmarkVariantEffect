@@ -1,7 +1,10 @@
-import requests
-from bs4 import BeautifulSoup
+'''
+Download the BEND data share into the current directory.
+'''
 import os
 
+import requests
+from bs4 import BeautifulSoup
 
 base_link = 'https://sid.erda.dk/'
 link = 'https://sid.erda.dk/cgi-sid/ls.py?share_id=f6hdp1zTzh&current_dir=.&flags=f'
@@ -15,12 +18,10 @@ def get_soup(link):
     return f
 
 
-# download file in link 
 def download_file(link, destination):
     r = requests.get(link, allow_redirects=True)
-    open(destination, 'wb').write(r.content)
-
-
+    with open(destination, 'wb') as f:
+        f.write(r.content)
 
 
 def rec(link, destination = './'):
@@ -36,5 +37,6 @@ def rec(link, destination = './'):
             link = f'{base_link}cgi-sid/{child.get("href")}'
             rec(link, destination)
 
-print('DOWNLOADING')
-rec(link, destination = '.')
+if __name__ == '__main__':
+    print('DOWNLOADING')
+    rec(link, destination = '.')
