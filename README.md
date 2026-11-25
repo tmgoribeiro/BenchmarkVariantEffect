@@ -75,7 +75,7 @@ python scripts/prepare_traitgym.py complex_traits_matched_9   data/variant_effec
 | `label` | 1 = functional / pathogenic, 0 = benign. **Required**: without it the scripts save the embeddings and then stop with an error when computing the AUROC |
 | `ref` | optional, but recommended: the scripts stop if more than 5% of the `ref` alleles do not match the genome (wrong build or coordinates) |
 
-Other columns are kept in the output csv.
+Other columns are kept in the output csv. Windows that reach past the start or end of a chromosome are filled with `N` (embedded as `A`), so the variant keeps its position in the window.
 
 ## Zero-shot variant effect prediction
 

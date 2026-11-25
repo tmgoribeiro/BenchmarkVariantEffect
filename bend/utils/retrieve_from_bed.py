@@ -34,6 +34,9 @@ class Annotation:
         if annotation is not None:
             if isinstance(annotation, str):
                 annotation = pd.read_csv(annotation, sep = '\t')
+            if 'chromosome' in annotation.columns:
+                # names such as 1 or 2 are read as numbers, but the FASTA names are strings
+                annotation['chromosome'] = annotation['chromosome'].astype(str)
 
             self.annotation = annotation
         if reference_genome is not None: 
@@ -110,9 +113,19 @@ class Annotation:
         """
 
         item = self.get_item(index)
+        if item.chromosome not in self.genome_dict:
+            raise KeyError(f'Chromosome {item.chromosome!r} is not in the genome FASTA, whose names are e.g. '
+                           f'{list(self.genome_dict)[:3]}. Check the chr prefix of the bed file.')
 
-        # get dna segment from genome dict
-        dna_segment =  str(self.genome_dict[item.chromosome].seq[int(item.start) : int(item.end)])
+        # the parts of the segment outside the chromosome are filled with N, so that it keeps its length
+        # and the variant its index
+        sequence = self.genome_dict[item.chromosome].seq
+        start, end = int(item.start), int(item.end)
+        length = max(end - start, 0)
+        lo, hi = max(start, 0), min(end, len(sequence))
+        inside = str(sequence[lo:hi]) if hi > lo else ''
+        left = min(max(-start, 0), length)
+        dna_segment = 'N' * left + inside + 'N' * (length - left - len(inside))
 
         return dna_segment
 
