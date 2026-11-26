@@ -116,7 +116,7 @@ Each run writes to `embeddings/<model>/<run_name>/`:
 
 ```bash
 python scripts/predict_variant_effects_pooling_strategies.py <bed_file> <run_name> <model> <checkpoint> <genome_fasta> \
-    [--extra_context 1024] [--neighbours 0 2 8 32 128] [--dataset <name>]
+    [--extra_context 1024] [--neighbours 2 8 32 128] [--dataset <name>]
 ```
 
 | Strategy | Score |
@@ -126,7 +126,7 @@ python scripts/predict_variant_effects_pooling_strategies.py <bed_file> <run_nam
 | `ccs_n{n}` | sum of the per-position cosine distances over ±n nucleotides |
 | `cls` | cosine distance between the `[CLS]` embeddings (`nt`, `dnabert`, `dnabert2`, `grover`) |
 
-Everything goes to `results/pooling_strategies/<model>/<dataset>/`: one csv per score and the embeddings of each pooling (`avg/n{n}/embeddings_<run_name>_n{n}.pkl`, `cls/embeddings_<run_name>_cls.pkl`). `--dataset` names that folder.
+Everything goes to `results/pooling_strategies/<model>/<dataset>/`: one csv per score and the embeddings: at the variant position, without pooling (`variant/embeddings_<run_name>_variant.pkl`, always saved), averaged over ±n (`avg/n{n}/embeddings_<run_name>_n{n}.pkl`) and `[CLS]` (`cls/embeddings_<run_name>_cls.pkl`). `--dataset` names that folder.
 
 ## Classifiers and ensembles
 
@@ -136,9 +136,9 @@ The scripts in `scripts/scripts_metrics/` read `results/pooling_strategies/` and
 # zero-shot AUROC/AUPRC, overall and per consequence
 python scripts/scripts_metrics/calculate_cosine_metrics.py results/pooling_strategies/*/<dataset>/cosine_distance/*.csv
 
-# MLP or random forest on the embeddings of one model (--pooling n0, n8, ..., cls)
-python scripts/scripts_metrics/classifiers/calculate_classifier_AUC.py <model> <dataset> <run_name> [--pooling n0]
-python scripts/scripts_metrics/classifiers/calculate_forest_classifier_AUC.py <model> <dataset> <run_name> [--pooling n0]
+# MLP or random forest on the embeddings of one model (--pooling variant (default, no pooling), n8, ..., cls)
+python scripts/scripts_metrics/classifiers/calculate_classifier_AUC.py <model> <dataset> <run_name> [--pooling variant]
+python scripts/scripts_metrics/classifiers/calculate_forest_classifier_AUC.py <model> <dataset> <run_name> [--pooling variant]
 
 # ensemble of several models; '<prefix>_{model}' gives the run name of each model
 python scripts/scripts_metrics/ensemble/<strategy>.py <dataset> --models dnabert2 grover hyenadna ag --out_files '<prefix>_{model}'

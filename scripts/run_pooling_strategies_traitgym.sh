@@ -1,7 +1,7 @@
 #!/bin/bash
 # Every pooling strategy and every metric for every model on the TraitGym datasets:
 #   1. predict_variant_effects_pooling_strategies.py: cosine at the variant, avg_n{n}, ccs_n{n} and cls (zero-shot)
-#   2. MLP and random forest on the embeddings of each model, for every pooling (n{n} and cls)
+#   2. MLP and random forest on the embeddings of each model: at the variant (no pooling), n{n} and cls
 #   3. the six ensembles, with all the models (only the models with a [CLS] token for cls)
 #
 # Run from the repository root, after scripts/run_variant_effects_traitgym.sh has created the bed files:
@@ -16,11 +16,11 @@ GENOME=${GENOME:-data/genomes/GRCh38.primary_assembly.genome.fa}
 BED_DIR=data/variant_effects
 CONTEXT=1024
 CAUSAL_CONTEXT=2047
-NEIGHBOURS="0 2 8 32 128"
+NEIGHBOURS="2 8 32 128"
 
 MODELS="dnabert2 grover hyenadna ag nt borzoi"
 CLS_MODELS="dnabert2 grover nt"   # the models with a [CLS] token
-POOLINGS="n0 n2 n8 n32 n128"
+POOLINGS="variant n2 n8 n32 n128"   # variant: the variant position alone, no pooling
 SCORES="cosine_distance avg_n2 avg_n8 avg_n32 avg_n128 ccs_n2 ccs_n8 ccs_n32 ccs_n128"
 METRICS=scripts/scripts_metrics
 FAILED=()

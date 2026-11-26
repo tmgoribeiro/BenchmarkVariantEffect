@@ -7,7 +7,8 @@ The inputs are the outputs of predict_variant_effects_pooling_strategies.py, all
 results/pooling_strategies/<model>/<dataset>/ (see pooling_dir):
 
     cosine_distance/cosine_distance_<out_file>.csv     distance at the variant position; also the labels
-    avg/n{n}/avg_n{n}_<out_file>.csv                   distance of the mean embeddings over [idx - n, idx + n]
+    variant/embeddings_<out_file>_variant.pkl          embeddings at the variant position, no pooling: (index, ref, alt) per variant
+    avg/n{n}/avg_n{n}_<out_file>.csv                   distance of the mean embeddings over [idx - n, idx + n], n > 0
     avg/n{n}/embeddings_<out_file>_n{n}.pkl            those mean embeddings: (index, ref, alt) per variant
     ccs/n{n}/ccs_n{n}_<out_file>.csv                   sum of the per-position distances over [idx - n, idx + n]
     cls/cls_<out_file>.csv, cls/embeddings_<out_file>_cls.pkl    [CLS] token (models that have one)
@@ -77,10 +78,11 @@ def scores_path(model, dataset, out_file, score='cosine_distance'):
 
 
 def embeddings_path(model, dataset, out_file, pooling):
-    '''pooling n{n}: the mean embeddings over [idx - n, idx + n], in avg/n{n}/; cls: the [CLS] embeddings, in cls/.'''
-    if pooling != 'cls' and not re.fullmatch(r'n\d+', pooling):
-        raise ValueError(f'pooling must be n<n> or cls, got {pooling!r}')
-    folder = score_folder('cls' if pooling == 'cls' else f'avg_{pooling}')
+    '''pooling variant: the embeddings at the variant position (no pooling), in variant/; n{n}: the mean embeddings
+    over [idx - n, idx + n], in avg/n{n}/; cls: the [CLS] embeddings, in cls/.'''
+    if pooling not in ('variant', 'cls') and not re.fullmatch(r'n[1-9]\d*', pooling):
+        raise ValueError(f'pooling must be variant, cls or n<n> with n > 0, got {pooling!r}')
+    folder = Path(pooling) if pooling in ('variant', 'cls') else score_folder(f'avg_{pooling}')
     return pooling_dir(model, dataset) / folder / f'embeddings_{out_file}_{pooling}.pkl'
 
 
@@ -178,7 +180,7 @@ def add_ensemble_args(parser, default_models):
 
 
 def add_embedding_args(parser, default_features):
-    parser.add_argument('--pooling', type=str, default='n0', help='Which embeddings file: n{n} (mean over [idx - n, idx + n]) or cls. Default n0, the variant position alone')
+    parser.add_argument('--pooling', type=str, default='variant', help='Which embeddings file: variant (the variant position alone, no pooling), n{n} (mean over [idx - n, idx + n], n > 0) or cls. Default variant')
     parser.add_argument('--features', choices=list(FEATURES), nargs='+', default=default_features,
                         help='How ref and alt are combined: diff = ref - alt, avg = (ref + alt) / 2, prod = ref * alt, '
                              'concat = [ref, alt]. Several values run once each')

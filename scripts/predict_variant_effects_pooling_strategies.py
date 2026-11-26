@@ -1,6 +1,7 @@
 '''
 Same scoring as predict_variant_effects.py, with several poolings around the variant (cosine_distance, avg_n{n}, ccs_n{n}, cls).
-Everything goes to results/pooling_strategies/<model>/<dataset>/<strategy>/.
+Everything goes to results/pooling_strategies/<model>/<dataset>/<strategy>/. The embeddings at the variant position
+(no pooling) are always saved, in variant/.
 '''
 import argparse
 from bend.utils import embedders, Annotation
@@ -37,10 +38,12 @@ def main():
     parser.add_argument('--extra_context', type=int, default=1024, help='Number of extra nucleotides to include on each side of the sequence')
     parser.add_argument('--kmer', type=int, default=6, help = 'Kmer size for the DNABERT model')
     parser.add_argument('--embedding_idx', type=int, default=None, help = 'Index of the embedding to use for computing the distance. Defaults to the position of the variant in the window. Only needs to be set for models whose embeddings are not one per nucleotide (dnabert)')
-    parser.add_argument('--neighbours', type=int, nargs='+', default=[0, 2, 8, 32, 128], help='Radii of the averaging window around embedding_idx (0 = single position)')
+    parser.add_argument('--neighbours', type=int, nargs='+', default=[2, 8, 32, 128], help='Radii (> 0) of the averaging windows around embedding_idx. The variant position alone is always saved, in variant/')
     parser.add_argument('--dataset', type=str, default=None, help='Name of the dataset folder. Defaults to the bed file name without the variant_effects_ prefix (variant_effects_disease.bed -> disease)')
 
     args = parser.parse_args()
+    if any(n < 1 for n in args.neighbours):
+        parser.error('--neighbours must be > 0: the variant position alone (no pooling) is always saved, in variant/')
 
     # out_file and dataset only name files and folders; a path in them would move the results elsewhere
     dataset = args.dataset if args.dataset is not None else dataset_name(args.bed_file)
@@ -115,11 +118,12 @@ def main():
     for score in scores:
         genome_annotation.annotation[score_column(score)] = np.nan
 
-    # the mean embeddings go next to the avg_n{n} csv, the [CLS] embeddings next to the cls csv
+    # the embeddings at the variant go to variant/, the mean embeddings next to the avg_n{n} csv, the [CLS] embeddings next to the cls csv
+    variant_path = embeddings_path(args.model, dataset, args.out_file, 'variant')
     out_paths = {n: embeddings_path(args.model, dataset, args.out_file, f'n{n}') for n in args.neighbours}
     cls_path = embeddings_path(args.model, dataset, args.out_file, 'cls')
     csv_paths = {score: scores_path(args.model, dataset, args.out_file, score) for score in scores}
-    for path in list(out_paths.values()) + list(csv_paths.values()) + ([cls_path] if has_cls else []):
+    for path in [variant_path] + list(out_paths.values()) + list(csv_paths.values()) + ([cls_path] if has_cls else []):
         path.parent.mkdir(parents=True, exist_ok=True)
     print(f'Results will be written to {out_dir}')
 
@@ -128,6 +132,7 @@ def main():
 
 
     with ExitStack() as stack:
+        variant_file = stack.enter_context(open(variant_path, "wb"))
         files = {r: stack.enter_context(open(p, "wb")) for r, p in out_paths.items()}
         if has_cls:
             cls_file = stack.enter_context(open(cls_path, "wb"))
@@ -165,6 +170,7 @@ def main():
 
             d_pos = 1 - (emb_wt * emb_alt).sum(1) / (np.linalg.norm(emb_wt, axis=1) * np.linalg.norm(emb_alt, axis=1))
             genome_annotation.annotation.loc[index, 'distance'] = d_pos[embedding_idx]
+            pickle.dump((index, emb_wt[embedding_idx], emb_alt[embedding_idx]), variant_file, protocol=pickle.HIGHEST_PROTOCOL)
 
             for n in args.neighbours:
                 lo, hi = max(0, embedding_idx - n), min(L, embedding_idx + n + 1)
